@@ -1,288 +1,277 @@
 'use strict';
 /**
- * Teste 6 — MessageChannel / BroadcastChannel: races de close/postMessage
+ * Teste 7 — WeakRef / FinalizationRegistry: GC pressure e lifetime de objetos
  *
- * O diagnóstico confirma: messageChannel: true, broadcastChannel: true, sab: false.
- * Contexto relevante: investigação anterior de MessagePort UAF identificou que
- * dispatchMessages() no WebKit dessa versão não tem `Ref<MessagePort> protect(*this)`,
- * criando um gap de qualidade de código mesmo que não seja exploitável no modelo
- * single-threaded. Aqui testamos comportamento observável via JS.
+ * O diagnóstico confirma: weakRef: true, weakMap: true.
+ * FinalizationRegistry pode não estar presente no WebKit 605.1.15 — verificado em runtime.
+ *
+ * WeakRef.deref() deve retornar undefined após o objeto ser coletado pelo GC.
+ * No PS4 sem JIT, o GC usa um modelo mark-sweep conservador sem gerações explícitas.
+ * Pressão de memória é a forma confiável de induzir coleta.
  *
  * Variantes:
- *   A — port.close() chamado DENTRO do handler onmessage (re-entrância no dispatcher)
- *   B — postMessage() para porta já fechada (deve ser silencioso ou lançar DOMException)
- *   C — ArrayBuffer transfer via postMessage (verificar detach do buffer original)
- *   D — BroadcastChannel: close() durante onmessage, depois postar mais mensagens
- *   E — MessageChannel criado sem start() em nenhuma porta — mensagem deve ser enfileirada
- *   F — Cadeia de MessageChannels: A→B→C→D; fechar B no meio e verificar integridade
+ *   A — WeakRef para objeto grande: criar, soltar referência forte, GC pressure, verificar deref()
+ *   B — WeakRef para nó DOM: criar, adicionar ao DOM, remover, GC pressure, verificar deref()
+ *   C — WeakMap: chave DOM removida do DOM sob GC — entry deve ser removida do mapa
+ *   D — FinalizationRegistry (se disponível): registrar, coletar, verificar callback
+ *   E — WeakRef em closure retornada de função: garantir que o objeto não escapa
+ *   F — deref() em loop com re-alocação: comportamento estável sem crash
  */
 (function (global) {
   global.FuzzerTests = global.FuzzerTests || {};
 
-  global.FuzzerTests['6'] = {
-    id      : 6,
-    name    : 'MessageChannel/BroadcastChannel — close durante dispatch, transfer, races',
-    category: 'Messaging',
-    timeout : 6000,
+  global.FuzzerTests['7'] = {
+    id      : 7,
+    name    : 'WeakRef/FinalizationRegistry — GC pressure, DOM nodes, WeakMap key lifecycle',
+    category: 'GC',
+    timeout : 8000,
 
     run: function () {
       return new Promise(function (resolve) {
         var anomalies = [];
-        var pending   = 6; // número de variantes assíncronas
 
-        function done() {
-          if (--pending <= 0) {
-            if (anomalies.length > 0) {
-              resolve({ status: 'ANOMALY', detail: anomalies.join(' | ') });
-            } else {
-              resolve({ status: 'PASS', detail: 'A-F sem anomalias' });
-            }
+        /* ── Utilitário: pressionar o GC alocando e descartando objetos grandes ── */
+        function pressureGC(rounds) {
+          for (var i = 0; i < rounds; i++) {
+            /* Alocar ~1MB por round e deixar cair imediatamente */
+            void new Array(250000).fill(i);
           }
         }
 
-        /* ── Variante A: close() dentro do handler de onmessage ── */
+        /* ── Variante A: WeakRef para objeto JS grande ── */
         (function variantA() {
           try {
-            var mc       = new MessageChannel();
-            var received = 0;
+            var ref;
+            (function () {
+              /* Objeto grande criado em escopo isolado — nenhuma referência forte escapa */
+              var obj = { data: new Array(50000).fill(0xDEAD), id: 'variantA-target' };
+              ref = new WeakRef(obj);
+              /* obj sai de escopo aqui */
+            }());
 
-            mc.port1.onmessage = function () {
-              received++;
-              /* Fechar DURANTE o dispatch */
-              mc.port1.close();
-              /* Postar de volta para port2 depois de fechar port1 */
-              try {
-                mc.port2.postMessage('after-port1-close');
-              } catch (_) {}
-            };
+            /* Antes da GC pressure, deref() ainda pode retornar o objeto */
+            var beforeGC = ref.deref();
+            if (beforeGC === undefined) {
+              /* Coletado já — incomum mas possível */
+              anomalies.push('A: objeto coletado antes de qualquer GC pressure (inesperado)');
+            }
 
-            mc.port2.onmessage = function (e) {
-              /* 'after-port1-close' não deve chegar — port1 foi fechada */
-              if (e.data === 'after-port1-close') {
-                /* Dependendo da spec isso pode ou não chegar — registrar como info,
-                 * mas verificar se causa comportamento inesperado posterior */
-              }
-              done();
-            };
+            pressureGC(40);
 
-            mc.port1.start();
-            mc.port2.start();
-            mc.port2.postMessage('trigger');
-
-            /* Timeout de segurança para variantA */
-            setTimeout(function () {
-              if (received === 0) {
-                anomalies.push('A: onmessage nunca disparou');
-              }
-              done();
-            }, 1500);
+            /* Após pressure, deref() PODE retornar undefined — comportamento correto.
+             * Não registramos como anomalia se retornar o objeto (GC não obrigado a coletar).
+             * Registramos apenas comportamentos inválidos. */
+            var afterGC = ref.deref();
+            if (afterGC !== undefined && afterGC.id !== 'variantA-target') {
+              /* Retornou algo, mas não é o objeto original — corrupção */
+              anomalies.push('A: deref() retornou objeto com id errado: ' + afterGC.id);
+            }
           } catch (e) {
             anomalies.push('A: ' + String(e));
-            done(); done(); /* decrementa os 2 dones de A */
           }
         }());
 
-        /* ── Variante B: postMessage para porta fechada ── */
+        /* ── Variante B: WeakRef para nó DOM removido ── */
         (function variantB() {
           try {
-            var mc = new MessageChannel();
-            mc.port1.start();
-            mc.port2.start();
-            mc.port1.close();
+            var ref;
+            var container = document.createElement('div');
+            document.body.appendChild(container);
 
-            var threw = false;
-            try {
-              /* Spec: deve lançar InvalidStateError */
-              mc.port1.postMessage('to-closed');
-            } catch (e) {
-              threw = true;
-              var name = e.name || (e.constructor && e.constructor.name) || '';
-              if (name !== 'InvalidStateError' && !(e instanceof DOMException)) {
-                anomalies.push('B: tipo de exceção inesperado: ' + name + ' — ' + e.message);
+            (function () {
+              var el = document.createElement('span');
+              el.textContent = 'weakref-target';
+              container.appendChild(el);
+              ref = new WeakRef(el);
+              /* Remover do DOM — o nó não tem mais referência forte no documento */
+              container.removeChild(el);
+              /* el sai de escopo aqui */
+            }());
+
+            document.body.removeChild(container);
+
+            pressureGC(30);
+
+            var after = ref.deref();
+            /* Se não foi coletado, verificar pelo menos que o nó ainda é válido */
+            if (after !== undefined) {
+              /* Nó deve estar desanexado */
+              if (after.isConnected) {
+                anomalies.push('B: nó DOM deveria estar desanexado mas isConnected=true');
+              }
+              /* Tentar operar sobre o nó — não deve crashar */
+              try {
+                void after.textContent;
+                void after.parentNode;
+              } catch (e2) {
+                anomalies.push('B: operação em nó DOM via WeakRef lançou: ' + String(e2));
               }
             }
-            if (!threw) {
-              /* Alguns motores silenciam — registrar como possível anomalia */
-              anomalies.push('B: postMessage para porta fechada não lançou exceção');
-            }
           } catch (e) {
-            anomalies.push('B: setup: ' + String(e));
+            anomalies.push('B: ' + String(e));
           }
-          done();
         }());
 
-        /* ── Variante C: ArrayBuffer transfer — verificar detach ── */
+        /* ── Variante C: WeakMap com chave DOM removida ── */
         (function variantC() {
           try {
-            var mc  = new MessageChannel();
-            var BUF_SIZE = 512 * 1024; // 512KB
-            var buf = new ArrayBuffer(BUF_SIZE);
+            var map  = new WeakMap();
+            var keys = [];
 
-            mc.port2.onmessage = function (e) {
-              var received = e.data;
-              if (!received || !(received instanceof ArrayBuffer)) {
-                anomalies.push('C: dado recebido não é ArrayBuffer: ' + typeof received);
-              } else if (received.byteLength !== BUF_SIZE) {
-                anomalies.push('C: byteLength recebido=' + received.byteLength + ' esperado=' + BUF_SIZE);
-              }
-              done();
-            };
-
-            mc.port1.start();
-            mc.port2.start();
-
-            /* Transfer do buffer */
-            mc.port1.postMessage(buf, [buf]);
-
-            /* Após transfer, buf deve estar detached */
-            if (buf.byteLength !== 0) {
-              anomalies.push('C: buffer não detached após transfer (byteLength=' + buf.byteLength + ')');
+            /* Criar 50 nós DOM, cada um com dado associado no WeakMap */
+            for (var i = 0; i < 50; i++) {
+              var el = document.createElement('div');
+              map.set(el, { index: i, payload: new Array(1000).fill(i) });
+              keys.push(el);
             }
 
-            /* Tentar acessar buffer detached deve lançar ou retornar 0 */
+            /* Verificar que todos existem antes de soltar */
+            for (var i = 0; i < keys.length; i++) {
+              if (!map.has(keys[i])) {
+                anomalies.push('C: WeakMap perdeu chave[' + i + '] prematuramente');
+                break;
+              }
+            }
+
+            /* Soltar todas as referências fortes */
+            keys = null;
+            pressureGC(30);
+
+            /* Não podemos iterar WeakMap (por design), então verificamos que
+             * o mapa não é uma referência indefinida e não crashou */
             try {
-              var view = new Uint8Array(buf);
-              /* Se chegou aqui, o buffer não foi realmente detachado — anomalia */
-              anomalies.push('C: Uint8Array de buffer detached construída sem exceção, length=' + view.length);
-            } catch (e2) {
-              /* TypeError esperado — OK */
-            }
-
-            /* Timeout caso onmessage não dispare */
-            setTimeout(function () {
-              if (mc.port2.onmessage) {
-                anomalies.push('C: onmessage nunca disparou');
-                done();
+              /* Tentar set/get com chave nova deve ainda funcionar */
+              var newKey = {};
+              map.set(newKey, 'alive');
+              if (map.get(newKey) !== 'alive') {
+                anomalies.push('C: WeakMap.get() retornou valor errado após GC pressure');
               }
-              mc.port1.close();
-              mc.port2.close();
-            }, 1500);
-
+              map.delete(newKey);
+            } catch (e2) {
+              anomalies.push('C: WeakMap corrompido após GC pressure: ' + String(e2));
+            }
           } catch (e) {
             anomalies.push('C: ' + String(e));
-            done();
           }
         }());
 
-        /* ── Variante D: BroadcastChannel close() dentro do onmessage ── */
+        /* ── Variante D: FinalizationRegistry (se disponível) ── */
         (function variantD() {
-          var CH_NAME = 'ps4fuzz-d-' + Date.now();
+          if (typeof FinalizationRegistry === 'undefined') {
+            /* Não disponível neste firmware — pular silenciosamente */
+            return;
+          }
           try {
-            var bc1      = new BroadcastChannel(CH_NAME);
-            var bc2      = new BroadcastChannel(CH_NAME);
-            var msgCount = 0;
+            var callbackLog = [];
+            var reg = new FinalizationRegistry(function (token) {
+              callbackLog.push(token);
+            });
 
-            bc2.onmessage = function (e) {
-              msgCount++;
-              if (msgCount === 1) {
-                /* Fecha durante o primeiro handler */
-                bc2.close();
-                /* Postar mais mensagens — bc2 não deve receber */
-                bc1.postMessage('should-not-arrive');
-                bc1.postMessage('should-not-arrive-2');
-              } else {
-                /* Se chegou mensagem após close, registrar */
-                anomalies.push('D: BroadcastChannel recebeu mensagem após close() (msg ' + msgCount + ')');
-              }
-            };
+            (function () {
+              var obj = { data: new Array(100000).fill(0xFF), tag: 'fin-target' };
+              reg.register(obj, 'fin-token-1');
+              /* obj sai de escopo */
+            }());
 
-            bc1.postMessage('trigger');
+            pressureGC(50);
 
+            /* O callback de finalização é chamado assincronamente — checar apenas
+             * que o mecanismo não crashou. O callback pode ou não ter disparado
+             * dentro deste timeout. */
             setTimeout(function () {
-              if (msgCount === 0) {
-                anomalies.push('D: BroadcastChannel onmessage nunca disparou');
-              }
-              try { bc1.close(); } catch (_) {}
-              try { bc2.close(); } catch (_) {}
-              done();
-            }, 1000);
-
+              /* Se o callback foi chamado, verificar que o token é correto */
+              callbackLog.forEach(function (token) {
+                if (token !== 'fin-token-1') {
+                  anomalies.push('D: FinalizationRegistry token incorreto: ' + token);
+                }
+              });
+            }, 100);
           } catch (e) {
             anomalies.push('D: ' + String(e));
-            done();
           }
         }());
 
-        /* ── Variante E: MessageChannel sem start() — mensagem enfileirada ── */
+        /* ── Variante E: WeakRef em closure — garantir que referência não escapa ── */
         (function variantE() {
           try {
-            var mc      = new MessageChannel();
-            var gotMsg  = false;
+            function makeWeakHolder(value) {
+              var inner = { secret: value, bulk: new Array(20000).fill(value) };
+              var ref   = new WeakRef(inner);
+              /* inner sai de escopo da função */
+              return ref;
+            }
 
-            mc.port2.onmessage = function (e) {
-              gotMsg = true;
-              if (e.data !== 'queued') {
-                anomalies.push('E: dado recebido incorreto: ' + JSON.stringify(e.data));
+            var refs = [];
+            for (var i = 0; i < 20; i++) {
+              refs.push(makeWeakHolder(i * 1000));
+            }
+
+            pressureGC(40);
+
+            /* Verificar que deref() não retorna valores cruzados (corrupção de heap) */
+            for (var i = 0; i < refs.length; i++) {
+              var obj = refs[i].deref();
+              if (obj !== undefined) {
+                /* Se ainda vivo, o secret deve bater */
+                var expected = i * 1000;
+                if (obj.secret !== expected) {
+                  anomalies.push('E: ref[' + i + '] secret corrompido: esperado ' + expected + ' encontrado ' + obj.secret);
+                }
               }
-            };
-
-            /* port1 e port2 NÃO têm start() chamado ainda */
-            mc.port1.postMessage('queued');
-
-            /* Agora chamar start() — deve liberar a mensagem enfileirada */
-            mc.port1.start();
-            mc.port2.start();
-
-            setTimeout(function () {
-              if (!gotMsg) {
-                anomalies.push('E: mensagem enfileirada não foi entregue após start()');
-              }
-              mc.port1.close();
-              mc.port2.close();
-              done();
-            }, 800);
-
+            }
           } catch (e) {
             anomalies.push('E: ' + String(e));
-            done();
           }
         }());
 
-        /* ── Variante F: cadeia A→B→C; fechar B no meio ── */
+        /* ── Variante F: deref() em loop com re-alocação simultânea ── */
         (function variantF() {
           try {
-            var ab = new MessageChannel(); // porta A→B
-            var bc = new MessageChannel(); // porta B→C
-            var received = [];
+            var refs  = [];
+            var BATCH = 100;
 
-            /* Nó A: envia para B */
-            /* Nó B: repassa para C, depois fecha */
-            ab.port2.onmessage = function (e) {
-              bc.port1.postMessage({ relay: e.data });
-              ab.port2.close(); // fecha B ao repassar
-            };
-
-            /* Nó C: coleta */
-            bc.port2.onmessage = function (e) {
-              received.push(e.data);
-            };
-
-            ab.port1.start(); ab.port2.start();
-            bc.port1.start(); bc.port2.start();
-
-            /* Enviar 3 mensagens — apenas a primeira deve percorrer A→B→C */
-            ab.port1.postMessage('msg1');
-            ab.port1.postMessage('msg2'); // B já fechado após msg1
-            ab.port1.postMessage('msg3');
-
-            setTimeout(function () {
-              if (received.length === 0) {
-                anomalies.push('F: nenhuma mensagem chegou ao nó C');
-              } else if (received.length > 1) {
-                /* msg2 e msg3 não deveriam chegar após close de B */
-                anomalies.push('F: ' + received.length + ' mensagens chegaram ao nó C (esperado 1)');
+            /* Criar batch de WeakRefs e soltar imediatamente */
+            (function () {
+              for (var i = 0; i < BATCH; i++) {
+                refs.push(new WeakRef({ idx: i, data: new Array(500).fill(i) }));
               }
-              try { ab.port1.close(); } catch (_) {}
-              try { bc.port1.close(); bc.port2.close(); } catch (_) {}
-              done();
-            }, 1000);
+              /* Objetos saem de escopo aqui */
+            }());
 
+            /* Loop de deref() enquanto aloca memória nova ao mesmo tempo */
+            var errors = 0;
+            for (var round = 0; round < 10; round++) {
+              /* Alocar novo objeto por round — pressão contínua */
+              void new Array(50000).fill(round);
+
+              for (var i = 0; i < refs.length; i++) {
+                try {
+                  var v = refs[i].deref();
+                  if (v !== undefined && typeof v.idx !== 'number') {
+                    errors++;
+                  }
+                } catch (e2) {
+                  errors++;
+                }
+              }
+            }
+
+            if (errors > 0) {
+              anomalies.push('F: ' + errors + ' erros em deref() durante re-alocação');
+            }
           } catch (e) {
             anomalies.push('F: ' + String(e));
-            done();
           }
         }());
 
+        /* ── Resolver após GC pressure + callbacks async ── */
+        setTimeout(function () {
+          if (anomalies.length > 0) {
+            resolve({ status: 'ANOMALY', detail: anomalies.join(' | ') });
+          } else {
+            resolve({ status: 'PASS', detail: 'A-F sem anomalias' });
+          }
+        }, 1500);
       });
     }
   };

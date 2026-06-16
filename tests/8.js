@@ -1,55 +1,318 @@
 'use strict';
 /**
- * SharedWorker para o Teste 8.
- * Mantém lista de portas abertas e responde a comandos simples.
- * Permite testar races de connect/close/postMessage no PS4.
+ * Teste 8 — SharedWorker lifecycle: races de connect/close/postMessage
+ *
+ * O diagnóstico confirma: sharedWorker: true.
+ * Contexto: bug de $500 HackerOne foi confirmado neste subsistema.
+ * O SharedWorker em WebKit mantém uma lista de MessagePorts associados.
+ * Races entre connect, port.close(), postMessage e self.close() podem
+ * expor UAF ou state machine corruption no lado C++.
+ *
+ * Dependência: workers/shared-worker.js deve estar acessível no servidor.
+ *
+ * Variantes:
+ *   A — Connect + port.close() imediato, antes mesmo de start()
+ *   B — postMessage enviado antes de port.start() (mensagem deve ser enfileirada)
+ *   C — Múltiplas conexões simultâneas ao mesmo SharedWorker
+ *   D — postMessage após port.close() (deve lançar InvalidStateError)
+ *   E — Worker self.close() enquanto porta ainda está ativa
+ *   F — Reconectar ao mesmo SharedWorker após self.close()
  */
-var _ports    = [];
-var _msgCount = 0;
+(function (global) {
+  global.FuzzerTests = global.FuzzerTests || {};
 
-self.onconnect = function (evt) {
-  var port = evt.ports[0];
-  _ports.push(port);
+  global.FuzzerTests['8'] = {
+    id      : 8,
+    name    : 'SharedWorker — connect/close races, multi-port, self.close() com porta ativa',
+    category: 'Worker',
+    timeout : 10000,
 
-  port.onmessage = function (e) {
-    _msgCount++;
-    var cmd = e.data && e.data.cmd;
+    run: function () {
+      return new Promise(function (resolve) {
+        var anomalies = [];
+        var WORKER_URL = 'workers/shared-worker.js';
 
-    switch (cmd) {
-      case 'ping':
-        try { port.postMessage({ type: 'pong', n: _msgCount }); } catch (_) {}
-        break;
+        /* Verificar suporte */
+        if (typeof SharedWorker === 'undefined') {
+          return resolve({ status: 'PASS', detail: 'SharedWorker não disponível — skip' });
+        }
 
-      case 'broadcast':
-        _ports.forEach(function (p) {
-          try { p.postMessage({ type: 'broadcast', payload: e.data.payload }); } catch (_) {}
-        });
-        break;
+        /* ── Helper: cria nova instância do SharedWorker com cache-bust ──
+         * Cada variante usa uma URL ligeiramente diferente para garantir
+         * que não compartilha estado com outras variantes.
+         * SharedWorkers são identificados por (URL + name), então name
+         * único isola cada variante.                                      */
+        function makeWorker(name) {
+          return new SharedWorker(WORKER_URL, { name: name || ('fuzz-' + Date.now()) });
+        }
 
-      case 'close-self':
-        /* Testa: self.close() com portas ainda abertas */
-        self.close();
-        break;
+        /* ── Helper: Promise que aguarda a primeira mensagem de uma porta ── */
+        function waitMsg(port, timeoutMs) {
+          return new Promise(function (res) {
+            var timer = setTimeout(function () { res(null); }, timeoutMs || 2000);
+            port.onmessage = function (e) {
+              clearTimeout(timer);
+              port.onmessage = null;
+              res(e.data);
+            };
+          });
+        }
 
-      case 'port-count':
-        try { port.postMessage({ type: 'port-count', count: _ports.length }); } catch (_) {}
-        break;
+        var pending = 6;
+        function done(varName, anomaly) {
+          if (anomaly) anomalies.push(varName + ': ' + anomaly);
+          if (--pending <= 0) {
+            if (anomalies.length > 0) {
+              resolve({ status: 'ANOMALY', detail: anomalies.join(' | ') });
+            } else {
+              resolve({ status: 'PASS', detail: 'A-F sem anomalias' });
+            }
+          }
+        }
 
-      case 'remove-me':
-        /* Remove essa porta da lista e fecha */
-        var idx = _ports.indexOf(port);
-        if (idx !== -1) _ports.splice(idx, 1);
-        try { port.postMessage({ type: 'removed' }); } catch (_) {}
-        break;
+        /* ── Variante A: close() imediato antes de start() ── */
+        (function variantA() {
+          try {
+            var w    = makeWorker('fuzz-A');
+            var port = w.port;
+            /* Fechar porta sem ter chamado start() — não deve crashar */
+            port.close();
+            /* Tentar usar a porta fechada */
+            try {
+              port.postMessage('after-close-no-start');
+            } catch (e) {
+              /* InvalidStateError esperado */
+            }
+            done('A');
+          } catch (e) {
+            done('A', String(e));
+          }
+        }());
 
-      default:
-        try { port.postMessage({ type: 'echo', data: e.data, msgNum: _msgCount }); } catch (_) {}
+        /* ── Variante B: postMessage antes de port.start() ── */
+        (function variantB() {
+          try {
+            var w    = makeWorker('fuzz-B');
+            var port = w.port;
+
+            var gotReply = false;
+            port.onmessage = function (e) {
+              gotReply = true;
+              if (!e.data || e.data.type !== 'pong') {
+                anomalies.push('B: resposta inesperada: ' + JSON.stringify(e.data));
+              }
+            };
+
+            /* postMessage ANTES de start() — deve ser enfileirado */
+            port.postMessage({ cmd: 'ping' });
+
+            /* Agora chamar start() — deve liberar a mensagem e obter pong */
+            port.start();
+
+            setTimeout(function () {
+              if (!gotReply) {
+                anomalies.push('B: pong nunca chegou após start() com mensagem pré-enfileirada');
+              }
+              port.close();
+              done('B');
+            }, 2000);
+          } catch (e) {
+            done('B', String(e));
+          }
+        }());
+
+        /* ── Variante C: múltiplas conexões simultâneas ── */
+        (function variantC() {
+          try {
+            /* Mesmo nome = mesmo worker, portas distintas */
+            var wName = 'fuzz-C-' + Date.now();
+            var ports = [];
+            var N     = 5;
+
+            for (var i = 0; i < N; i++) {
+              var w = makeWorker(wName);
+              ports.push(w.port);
+              w.port.start();
+            }
+
+            /* Perguntar a contagem de portas para o worker via a última porta */
+            var lastPort  = ports[ports.length - 1];
+            var gotCount  = false;
+            var savedHandler = lastPort.onmessage;
+
+            lastPort.onmessage = function (e) {
+              if (e.data && e.data.type === 'port-count') {
+                gotCount = true;
+                var count = e.data.count;
+                if (count < 1 || count > N + 2) {
+                  /* Margem de +2 para workers que possam ter portas de rounds anteriores */
+                  anomalies.push('C: port-count=' + count + ' inesperado para N=' + N);
+                }
+              } else if (e.data && e.data.type === 'connected') {
+                /* Ignorar mensagem de connected — esperar port-count */
+                lastPort.postMessage({ cmd: 'port-count' });
+              }
+            };
+
+            setTimeout(function () {
+              if (!gotCount) {
+                anomalies.push('C: port-count nunca respondido');
+              }
+              ports.forEach(function (p) { try { p.close(); } catch (_) {} });
+              done('C');
+            }, 2500);
+          } catch (e) {
+            done('C', String(e));
+          }
+        }());
+
+        /* ── Variante D: postMessage após port.close() ── */
+        (function variantD() {
+          try {
+            var w    = makeWorker('fuzz-D');
+            var port = w.port;
+            port.start();
+
+            /* Aguardar conexão confirmada antes de fechar */
+            port.onmessage = function (e) {
+              if (e.data && e.data.type === 'connected') {
+                port.onmessage = null;
+                port.close();
+
+                var threw = false;
+                try {
+                  port.postMessage({ cmd: 'ping' });
+                } catch (e2) {
+                  threw = true;
+                  var name = e2.name || '';
+                  if (name !== 'InvalidStateError') {
+                    anomalies.push('D: exceção esperada InvalidStateError, recebeu: ' + name);
+                  }
+                }
+                if (!threw) {
+                  anomalies.push('D: postMessage após close() não lançou exceção');
+                }
+                done('D');
+              }
+            };
+
+            /* Timeout de segurança caso 'connected' nunca chegue */
+            setTimeout(function () {
+              if (w.port.onmessage !== null) {
+                anomalies.push('D: mensagem connected nunca recebida');
+                done('D');
+              }
+            }, 2000);
+          } catch (e) {
+            done('D', String(e));
+          }
+        }());
+
+        /* ── Variante E: worker self.close() com porta ativa ── */
+        (function variantE() {
+          try {
+            var w    = makeWorker('fuzz-E');
+            var port = w.port;
+            port.start();
+
+            var seq = [];
+            port.onmessage = function (e) {
+              seq.push(e.data && e.data.type);
+
+              if (seq.length === 1 && e.data.type === 'connected') {
+                /* Pedir ao worker para fechar a si mesmo */
+                port.postMessage({ cmd: 'close-self' });
+
+                /* Tentar postar mais mensagens após o worker ter feito self.close() */
+                setTimeout(function () {
+                  try {
+                    port.postMessage({ cmd: 'ping' });
+                  } catch (_) {
+                    /* Pode lançar — porta detecta worker morto */
+                  }
+                }, 100);
+              }
+            };
+
+            setTimeout(function () {
+              if (seq.length === 0) {
+                anomalies.push('E: nenhuma mensagem recebida antes de self.close()');
+              }
+              /* Não esperamos pong — o worker se fechou.
+               * O importante é que o browser não crashou. */
+              try { port.close(); } catch (_) {}
+              done('E');
+            }, 2500);
+          } catch (e) {
+            done('E', String(e));
+          }
+        }());
+
+        /* ── Variante F: reconectar após self.close() ── */
+        (function variantF() {
+          try {
+            /* Fase 1: conectar e pedir self.close() */
+            var wName = 'fuzz-F-' + Date.now();
+            var w1    = makeWorker(wName);
+            w1.port.start();
+
+            w1.port.onmessage = function (e) {
+              if (e.data && e.data.type === 'connected') {
+                w1.port.onmessage = null;
+                w1.port.postMessage({ cmd: 'close-self' });
+
+                /* Fase 2: aguardar um ciclo e reconectar com mesmo nome */
+                setTimeout(function () {
+                  try {
+                    var w2   = makeWorker(wName);
+                    var port2 = w2.port;
+                    var gotConn = false;
+
+                    port2.onmessage = function (e2) {
+                      if (e2.data && e2.data.type === 'connected') {
+                        gotConn = true;
+                        /* Verificar que o worker recomeçou com port-count = 1 */
+                        port2.postMessage({ cmd: 'port-count' });
+                      } else if (e2.data && e2.data.type === 'port-count') {
+                        var count = e2.data.count;
+                        if (count !== 1) {
+                          anomalies.push('F: port-count=' + count + ' após reconexão (esperado 1)');
+                        }
+                      }
+                    };
+                    port2.start();
+
+                    setTimeout(function () {
+                      if (!gotConn) {
+                        anomalies.push('F: reconexão após self.close() não recebeu connected');
+                      }
+                      try { port2.close(); } catch (_) {}
+                      try { w1.port.close(); } catch (_) {}
+                      done('F');
+                    }, 2000);
+                  } catch (e3) {
+                    done('F', 'reconexão: ' + String(e3));
+                  }
+                }, 300);
+              }
+            };
+
+            /* Timeout global de variantF */
+            setTimeout(function () {
+              if (w1.port.onmessage !== null) {
+                anomalies.push('F: fase 1 nunca recebeu connected');
+                try { w1.port.close(); } catch (_) {}
+                done('F');
+              }
+            }, 4000);
+
+          } catch (e) {
+            done('F', String(e));
+          }
+        }());
+
+      });
     }
   };
 
-  port.start();
-
-  try {
-    port.postMessage({ type: 'connected', portCount: _ports.length });
-  } catch (_) {}
-};
+}(window));
