@@ -1,132 +1,320 @@
 'use strict';
 
-(function(global){
+(function (global) {
 
-global.FuzzerTests=global.FuzzerTests||{};
+global.FuzzerTests = global.FuzzerTests || {};
 
-global.FuzzerTests['14']={
+global.FuzzerTests['14'] = {
 
-id:14,
+id: 14,
 
-name:'Array.sort Structural Stability',
+name: 'Array.sort Structural Stability (v2)',
 
-timeout:6000,
+category: 'JSC-Array',
 
-run:function(){
+timeout: 6000,
 
-let anomalies=[];
+run: function () {
 
-const SENTINEL={id:1337};
+let anomalies = [];
+let infos = [];
 
-let arr=[];
+const SENTINEL = {
+  id: 0x1337,
+  marker: true
+};
 
-for(let i=0;i<16;i++){
+const SIZE = 16;
+const FAR  = 216;
 
-arr.push(i+0.25);
+let arr = [];
 
-}
+for (let i = 0; i < SIZE; i++) {
 
-let mutated=false;
-
-let lengths=[];
-
-arr.sort(function(a,b){
-
-lengths.push(arr.length);
-
-if(!mutated){
-
-mutated=true;
-
-/* força transição */
-
-arr[4]=SENTINEL;
-
-arr[216]=9999.123;
+  arr.push(i + 0.25);
 
 }
 
-return a-b;
+let mutated = false;
+
+let lengths = [];
+
+try {
+
+arr.sort(function (a, b) {
+
+  lengths.push(arr.length);
+
+  if (!mutated) {
+
+    mutated = true;
+
+    /*
+      força transição
+      DoubleArray -> ContiguousArray
+    */
+
+    arr[4] = SENTINEL;
+
+    /*
+      força expansão distante
+    */
+
+    arr[FAR] = 9999.123;
+
+  }
+
+  return a - b;
 
 });
 
-if(arr.length!==217){
+/* --------------------------
+   Detector 1
+   Comprimento final
+-------------------------- */
 
-anomalies.push(
+if (arr.length !== 217) {
 
-'length='+arr.length
+  anomalies.push(
+
+    'length inesperado=' + arr.length
+
+  );
+
+}
+
+/* --------------------------
+   Detector 2
+   Procurar SENTINEL
+-------------------------- */
+
+let sentinelIndexes = [];
+
+for (let i = 0; i < arr.length; i++) {
+
+  if (arr[i] === SENTINEL) {
+
+    sentinelIndexes.push(i);
+
+  }
+
+}
+
+if (sentinelIndexes.length === 0) {
+
+  anomalies.push(
+
+    'SENTINEL desapareceu completamente'
+
+  );
+
+} else {
+
+  infos.push(
+
+    'sentinel=' +
+
+    sentinelIndexes.join(',')
+
+  );
+
+}
+
+/* --------------------------
+   Detector 3
+   Contar objetos
+-------------------------- */
+
+let objectCount = 0;
+
+for (let i = 0; i < arr.length; i++) {
+
+  if (
+
+    typeof arr[i] === 'object' &&
+
+    arr[i] !== null
+
+  ) {
+
+    objectCount++;
+
+  }
+
+}
+
+infos.push(
+
+  'objects=' + objectCount
 
 );
 
+if (
+
+  sentinelIndexes.length > 0 &&
+
+  objectCount === 0
+
+) {
+
+  anomalies.push(
+
+    'contador inconsistente'
+
+  );
+
 }
 
-if(arr[4]!==SENTINEL){
+/* --------------------------
+   Detector 4
+   Tipos impossíveis
+-------------------------- */
 
-anomalies.push(
+for (let i = 0; i < arr.length; i++) {
 
-'sentinel perdido'
+  let v = arr[i];
+
+  if (v === undefined) {
+
+    continue;
+
+  }
+
+  let t = typeof v;
+
+  if (
+
+    t !== 'number' &&
+
+    t !== 'object'
+
+  ) {
+
+    anomalies.push(
+
+      'tipo inesperado idx=' +
+
+      i +
+
+      ' typeof=' +
+
+      t
+
+    );
+
+  }
+
+}
+
+/* --------------------------
+   Detector 5
+   NaN inesperado
+-------------------------- */
+
+for (let i = 0; i < arr.length; i++) {
+
+  let v = arr[i];
+
+  if (
+
+    typeof v === 'number' &&
+
+    Number.isNaN(v)
+
+  ) {
+
+    anomalies.push(
+
+      'NaN inesperado idx=' +
+
+      i
+
+    );
+
+  }
+
+}
+
+/* --------------------------
+   Detector 6
+   Múltiplas expansões
+-------------------------- */
+
+let uniqueLengths =
+
+[...new Set(lengths)];
+
+infos.push(
+
+  'expansoes=' +
+
+  uniqueLengths.join(',')
 
 );
 
-}
+if (
 
-for(let i=0;i<arr.length;i++){
+  uniqueLengths.length > 5
 
-let v=arr[i];
+) {
 
-if(v===undefined){
+  anomalies.push(
 
-continue;
+    'expansões excessivas'
 
-}
-
-if(
-
-typeof v!=='number' &&
-
-typeof v!=='object'
-
-){
-
-anomalies.push(
-
-'tipo inesperado idx='+i
-
-);
+  );
 
 }
 
+/* --------------------------
+   Resultado
+-------------------------- */
+
+if (anomalies.length) {
+
+  return {
+
+    status: 'ANOMALY',
+
+    detail:
+
+      anomalies.join(' | ') +
+
+      (infos.length
+
+        ? ' | INFO: ' +
+
+          infos.join(' | ')
+
+        : '')
+
+  };
+
 }
 
-let unique=[...new Set(lengths)];
+return {
 
-if(unique.length>4){
+  status: 'PASS',
 
-anomalies.push(
+  detail:
 
-'expansões excessivas='+unique.join(',')
+    'OK | ' +
 
-);
-
-}
-
-return anomalies.length
-
-? {
-
-status:'ANOMALY',
-
-detail:anomalies.join(' | ')
-
-}
-
-: {
-
-status:'PASS',
-
-detail:'estrutura estável'
+    infos.join(' | ')
 
 };
+
+} catch (e) {
+
+return {
+
+  status: 'ANOMALY',
+
+  detail: String(e)
+
+};
+
+}
 
 }
 
