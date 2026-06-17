@@ -82,32 +82,101 @@
           }
         }());
 
-        /* ── Variante B: postMessage para porta fechada ── */
+        /* ── Variante B: postMessage para porta fechada ──
+         *
+         * CONFIRMADO: WebKit 605.1.15 faz silent drop em vez de InvalidStateError.
+         *
+         * B1 — comportamento base (mantido)
+         * B2 — verificar se a mensagem "silenciada" chega em port2
+         *       (se o motor entregou antes de detectar que port1 estava fechada)
+         * B3 — race: fechar e postar na mesma microtask chain via Promise
+         */
         (function variantB() {
-          try {
-            var mc = new MessageChannel();
-            mc.port1.start();
-            mc.port2.start();
-            mc.port1.close();
-
-            var threw = false;
+          /* B1: base confirmado */
+          (function b1() {
             try {
-              /* Spec: deve lançar InvalidStateError */
-              mc.port1.postMessage('to-closed');
-            } catch (e) {
-              threw = true;
-              var name = e.name || (e.constructor && e.constructor.name) || '';
-              if (name !== 'InvalidStateError' && !(e instanceof DOMException)) {
-                anomalies.push('B: tipo de exceção inesperado: ' + name + ' — ' + e.message);
+              var mc = new MessageChannel();
+              mc.port1.start();
+              mc.port2.start();
+              mc.port1.close();
+
+              var threw = false;
+              try {
+                mc.port1.postMessage('to-closed');
+              } catch (e) {
+                threw = true;
+                var name = e.name || (e.constructor && e.constructor.name) || '';
+                if (name !== 'InvalidStateError' && !(e instanceof DOMException)) {
+                  anomalies.push('B1: exceção inesperada: ' + name + ' — ' + e.message);
+                }
               }
+              if (!threw) {
+                anomalies.push('B1: silent drop confirmado — postMessage não lançou InvalidStateError');
+              }
+            } catch (e) {
+              anomalies.push('B1: setup: ' + String(e));
             }
-            if (!threw) {
-              /* Alguns motores silenciam — registrar como possível anomalia */
-              anomalies.push('B: postMessage para porta fechada não lançou exceção');
-            }
-          } catch (e) {
-            anomalies.push('B: setup: ' + String(e));
-          }
+          }());
+
+          /* B2: a mensagem silenciada chega em port2?
+           * Se WebKit faz drop antes de enfileirar a mensagem: port2.onmessage não dispara.
+           * Se faz drop depois de enfileirar: a mensagem pode chegar em port2
+           * mesmo com port1 fechada — estado inconsistente. */
+          (function b2() {
+            var mc2 = new MessageChannel();
+            mc2.port1.start();
+            mc2.port2.start();
+
+            var ghostArrived = false;
+            mc2.port2.onmessage = function (e) {
+              if (e.data === 'ghost') ghostArrived = true;
+            };
+
+            /* Fechar port1 e imediatamente postar */
+            mc2.port1.close();
+            try { mc2.port1.postMessage('ghost'); } catch (_) {}
+
+            setTimeout(function () {
+              if (ghostArrived) {
+                anomalies.push(
+                  'B2: mensagem "ghost" chegou em port2 após port1.close() + postMessage silencioso' +
+                  ' — drop ocorreu APÓS enfileiramento'
+                );
+              }
+              mc2.port2.close();
+            }, 400);
+          }());
+
+          /* B3: race close/postMessage via microtask chain
+           * Fechar em Promise.resolve().then() e postar logo depois —
+           * o dispatch da mensagem e o close competem no microtask queue. */
+          (function b3() {
+            var mc3   = new MessageChannel();
+            mc3.port1.start();
+            mc3.port2.start();
+
+            var raceArrived = false;
+            mc3.port2.onmessage = function (e) {
+              if (e.data === 'race') raceArrived = true;
+            };
+
+            Promise.resolve().then(function () {
+              mc3.port1.close();
+            });
+            /* Postar no mesmo ciclo síncrono — antes do then rodar */
+            try { mc3.port1.postMessage('race'); } catch (_) {}
+
+            setTimeout(function () {
+              if (raceArrived) {
+                /* Mensagem postada ANTES do close chegou — comportamento correto */
+                anomalies.push('B3: INFO — race ganho pela mensagem: "race" chegou antes do close()');
+              } else {
+                anomalies.push('B3: INFO — close() ganhou a race: "race" não chegou em port2');
+              }
+              mc3.port2.close();
+            }, 400);
+          }());
+
           done();
         }());
 
