@@ -101,7 +101,8 @@
               );
             }
           } else if (finalLen > SIZE) {
-            /* Array expandiu — escrita capturada no length, não é OOB Write */
+            /* Array expandiu — escrita capturada no length, não é OOB Write puro.
+             * Registrar finalLen para calibrar B2/B3. */
             var missing = [SIZE, SIZE + 1, SIZE + 7].filter(function (idx) {
               return a[idx] !== MARKER;
             });
@@ -111,12 +112,114 @@
                 ' mas MARKER ausente nos idx [' + missing.join(', ') + ']'
               );
             }
-            /* Comportamento esperado quando sort NÃO restaura o length */
+            /* PASS informativo — anotar finalLen */
+            anomalies.push('B: INFO — sort expandiu array para finalLen=' + finalLen +
+                           ' (MARKERs dentro do novo boundary)');
           } else {
             anomalies.push('B: length inválido após sort: ' + finalLen);
           }
         } catch (e) {
           anomalies.push('B: exceção: ' + String(e));
+        }
+      }());
+
+      /* ── Variante B2: objeto além de SIZE — força ContiguousArray nos slots extras ──
+       *
+       * Se o sort expande o array (finalLen > SIZE), arr[SIZE] é um {} acessível.
+       * Se o sort restaura length=SIZE, arr[SIZE] tem um objeto além do boundary.
+       * Adicionalmente: verificar se arr[SIZE] pode ser lido como ponteiro JSValue
+       * (acesso a objeto via índice além de length declarado).
+       */
+      (function variantB2() {
+        try {
+          var SIZE   = 32;
+          var SENTINEL = { tag: 'B2-obj', uid: 0xDEAD };
+          var a = [];
+          for (var i = 0; i < SIZE; i++) a.push(Math.random());
+          var done = false;
+
+          a.sort(function (x, y) {
+            if (!done) {
+              done = true;
+              a[SIZE]     = SENTINEL;   /* objeto → força ContiguousArray */
+              a[SIZE + 1] = SENTINEL;
+            }
+            return x - y;
+          });
+
+          var finalLen = a.length;
+          /* Tentar ler o objeto além do boundary declarado */
+          var readBack = a[SIZE];
+
+          if (finalLen === SIZE) {
+            /* Sort restaurou length — objeto em a[SIZE] é OOB Write de JSValue */
+            if (readBack === SENTINEL || (readBack && readBack.tag === 'B2-obj')) {
+              anomalies.push(
+                'B2: OOB Write de JSValue — length=' + SIZE +
+                ' mas a[SIZE] ainda aponta para SENTINEL: ' + JSON.stringify(readBack)
+              );
+            }
+          } else {
+            /* Sort expandiu — registrar que objeto é acessível em finalLen */
+            anomalies.push(
+              'B2: INFO — sort expandiu para ' + finalLen +
+              ', a[SIZE]=' + (readBack && readBack.tag ? readBack.tag : typeof readBack)
+            );
+          }
+        } catch (e) {
+          anomalies.push('B2: ' + String(e));
+        }
+      }());
+
+      /* ── Variante B3: hole gigante — escrever em arr[SIZE + 200] ──
+       *
+       * O comparator escreve num slot muito além de SIZE.
+       * Se o sort usa length cacheado (SIZE), o slot fica "órfão" num hole.
+       * Verificar: finalLen, acesso ao slot, integridade da butterfly.
+       */
+      (function variantB3() {
+        try {
+          var SIZE   = 16;
+          var FAR    = SIZE + 200;
+          var MARKER = 9999.0001;
+          var a      = [];
+          for (var i = 0; i < SIZE; i++) a.push(i * 1.1);
+          var done   = false;
+
+          a.sort(function (x, y) {
+            if (!done) {
+              done = true;
+              a[FAR] = MARKER; /* escreve 200 slots além do fim */
+            }
+            return x - y;
+          });
+
+          var finalLen = a.length;
+          var farVal   = a[FAR];
+
+          if (finalLen === SIZE) {
+            /* Sort restaurou length — FAR slot persiste além do boundary? */
+            if (farVal === MARKER) {
+              anomalies.push(
+                'B3: OOB Write com hole — length=' + SIZE +
+                ' mas a[' + FAR + ']=MARKER persiste'
+              );
+            }
+          } else if (finalLen > SIZE && finalLen <= FAR) {
+            /* Sort expandiu mas ficou antes de FAR — a[FAR] é hole */
+            anomalies.push(
+              'B3: INFO — finalLen=' + finalLen + ' < FAR=' + FAR +
+              ', a[FAR]=' + farVal
+            );
+          } else if (finalLen > FAR) {
+            /* Sort expandiu até FAR */
+            anomalies.push(
+              'B3: INFO — sort expandiu até finalLen=' + finalLen +
+              ', a[FAR]=' + farVal
+            );
+          }
+        } catch (e) {
+          anomalies.push('B3: ' + String(e));
         }
       }());
 
@@ -187,4 +290,3 @@
   };
 
 }(window));
-
