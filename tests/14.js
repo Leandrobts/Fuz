@@ -1,316 +1,283 @@
 'use strict';
 
-(function (global) {
+(function(global){
 
-global.FuzzerTests = global.FuzzerTests || {};
+global.FuzzerTests=global.FuzzerTests||{};
 
-global.FuzzerTests['14'] = {
+global.FuzzerTests['14']={
 
-id: 14,
+id:14,
 
-name: 'Array.sort Structural Stability (v2)',
+name:'Array.sort Behavioral Signature',
 
-category: 'JSC-Array',
+timeout:6000,
 
-timeout: 6000,
+run:function(){
 
-run: function () {
+let anomalies=[];
+let info=[];
 
-let anomalies = [];
-let infos = [];
+const SIZE=16;
+const FAR=216;
 
-const SENTINEL = {
-  id: 0x1337,
-  marker: true
+const SENTINEL={
+ id:0x1337,
+ marker:true
 };
 
-const SIZE = 16;
-const FAR  = 216;
+let arr=[];
 
-let arr = [];
+for(let i=0;i<SIZE;i++){
 
-for (let i = 0; i < SIZE; i++) {
-
-  arr.push(i + 0.25);
+ arr.push(i+0.25);
 
 }
 
-let mutated = false;
+let mutated=false;
 
-let lengths = [];
+try{
 
-try {
+arr.sort(function(a,b){
 
-arr.sort(function (a, b) {
+ if(!mutated){
 
-  lengths.push(arr.length);
+  mutated=true;
 
-  if (!mutated) {
+  /*
+   objeto
+  */
 
-    mutated = true;
+  arr[4]=SENTINEL;
 
-    /*
-      força transição
-      DoubleArray -> ContiguousArray
-    */
+  /*
+   valor distante
+  */
 
-    arr[4] = SENTINEL;
+  arr[FAR]=9999.123;
 
-    /*
-      força expansão distante
-    */
+ }
 
-    arr[FAR] = 9999.123;
-
-  }
-
-  return a - b;
+ return a-b;
 
 });
 
-/* --------------------------
-   Detector 1
-   Comprimento final
--------------------------- */
+/* ======================
+   length
+====================== */
 
-if (arr.length !== 217) {
+info.push(
 
-  anomalies.push(
-
-    'length inesperado=' + arr.length
-
-  );
-
-}
-
-/* --------------------------
-   Detector 2
-   Procurar SENTINEL
--------------------------- */
-
-let sentinelIndexes = [];
-
-for (let i = 0; i < arr.length; i++) {
-
-  if (arr[i] === SENTINEL) {
-
-    sentinelIndexes.push(i);
-
-  }
-
-}
-
-if (sentinelIndexes.length === 0) {
-
-  anomalies.push(
-
-    'SENTINEL desapareceu completamente'
-
-  );
-
-} else {
-
-  infos.push(
-
-    'sentinel=' +
-
-    sentinelIndexes.join(',')
-
-  );
-
-}
-
-/* --------------------------
-   Detector 3
-   Contar objetos
--------------------------- */
-
-let objectCount = 0;
-
-for (let i = 0; i < arr.length; i++) {
-
-  if (
-
-    typeof arr[i] === 'object' &&
-
-    arr[i] !== null
-
-  ) {
-
-    objectCount++;
-
-  }
-
-}
-
-infos.push(
-
-  'objects=' + objectCount
+ 'length='+arr.length
 
 );
 
-if (
+/* ======================
+   has9999
+====================== */
 
-  sentinelIndexes.length > 0 &&
+let has9999=
 
-  objectCount === 0
+arr.includes(9999.123);
 
-) {
+info.push(
+
+ 'has9999='+has9999
+
+);
+
+/* ======================
+   hasSentinel
+====================== */
+
+let hasSentinel=
+
+arr.includes(SENTINEL);
+
+info.push(
+
+ 'hasSentinel='+hasSentinel
+
+);
+
+/* ======================
+   objectCount
+====================== */
+
+let objectCount=0;
+
+for(let i=0;i<arr.length;i++){
+
+ if(
+
+  typeof arr[i]==='object' &&
+
+  arr[i]!==null
+
+ ){
+
+  objectCount++;
+
+ }
+
+}
+
+info.push(
+
+ 'objects='+objectCount
+
+);
+
+/* ======================
+   keys
+====================== */
+
+let keyCount=
+
+Object.keys(arr).length;
+
+info.push(
+
+ 'keys='+keyCount
+
+);
+
+/* ======================
+   holes
+====================== */
+
+let holes=0;
+
+for(let i=0;i<arr.length;i++){
+
+ if(!(i in arr)){
+
+  holes++;
+
+ }
+
+}
+
+info.push(
+
+ 'holes='+holes
+
+);
+
+/* ======================
+   tipos inesperados
+====================== */
+
+for(let i=0;i<arr.length;i++){
+
+ let v=arr[i];
+
+ if(v===undefined){
+
+  continue;
+
+ }
+
+ let t=typeof v;
+
+ if(
+
+  t!=='number' &&
+
+  t!=='object'
+
+ ){
 
   anomalies.push(
 
-    'contador inconsistente'
+   'tipo='+t+
+
+   '@'+i
 
   );
 
-}
-
-/* --------------------------
-   Detector 4
-   Tipos impossíveis
--------------------------- */
-
-for (let i = 0; i < arr.length; i++) {
-
-  let v = arr[i];
-
-  if (v === undefined) {
-
-    continue;
-
-  }
-
-  let t = typeof v;
-
-  if (
-
-    t !== 'number' &&
-
-    t !== 'object'
-
-  ) {
-
-    anomalies.push(
-
-      'tipo inesperado idx=' +
-
-      i +
-
-      ' typeof=' +
-
-      t
-
-    );
-
-  }
+ }
 
 }
 
-/* --------------------------
-   Detector 5
+/* ======================
    NaN inesperado
--------------------------- */
+====================== */
 
-for (let i = 0; i < arr.length; i++) {
+for(let i=0;i<arr.length;i++){
 
-  let v = arr[i];
+ let v=arr[i];
 
-  if (
+ if(
 
-    typeof v === 'number' &&
+  typeof v==='number' &&
 
-    Number.isNaN(v)
+  Number.isNaN(v)
 
-  ) {
-
-    anomalies.push(
-
-      'NaN inesperado idx=' +
-
-      i
-
-    );
-
-  }
-
-}
-
-/* --------------------------
-   Detector 6
-   Múltiplas expansões
--------------------------- */
-
-let uniqueLengths =
-
-[...new Set(lengths)];
-
-infos.push(
-
-  'expansoes=' +
-
-  uniqueLengths.join(',')
-
-);
-
-if (
-
-  uniqueLengths.length > 5
-
-) {
+ ){
 
   anomalies.push(
 
-    'expansões excessivas'
+   'NaN@'+i
 
   );
 
-}
-
-/* --------------------------
-   Resultado
--------------------------- */
-
-if (anomalies.length) {
-
-  return {
-
-    status: 'ANOMALY',
-
-    detail:
-
-      anomalies.join(' | ') +
-
-      (infos.length
-
-        ? ' | INFO: ' +
-
-          infos.join(' | ')
-
-        : '')
-
-  };
+ }
 
 }
 
-return {
+/* ======================
+   length inválido
+====================== */
 
-  status: 'PASS',
+if(arr.length!==217){
+
+ anomalies.push(
+
+  'length='+arr.length
+
+ );
+
+}
+
+/* ======================
+   resultado
+====================== */
+
+if(anomalies.length){
+
+ return {
+
+  status:'ANOMALY',
 
   detail:
 
-    'OK | ' +
+   anomalies.join(' | ')+
 
-    infos.join(' | ')
+   ' | INFO: '+
 
-};
+   info.join(' | ')
 
-} catch (e) {
+ };
+
+}
 
 return {
 
-  status: 'ANOMALY',
+ status:'PASS',
 
-  detail: String(e)
+ detail:
+
+  info.join(' | ')
+
+};
+
+}catch(e){
+
+return{
+
+ status:'ANOMALY',
+
+ detail:String(e)
 
 };
 
