@@ -89,29 +89,47 @@
           }
         }());
 
-        /* ── Variante B: postMessage antes de port.start() ── */
+        /* ── Variante B: postMessage antes de port.start() ──
+         *
+         * Fix: o handler anterior não filtrava a mensagem 'connected'
+         * que o SharedWorker envia imediatamente ao conectar, antes
+         * mesmo de processar qualquer mensagem enfileirada.
+         * Agora ignoramos 'connected' e aguardamos especificamente 'pong'.
+         */
         (function variantB() {
           try {
             var w    = makeWorker('fuzz-B');
             var port = w.port;
 
-            var gotReply = false;
+            var gotPong  = false;
+            var gotConn  = false;
+
             port.onmessage = function (e) {
-              gotReply = true;
-              if (!e.data || e.data.type !== 'pong') {
-                anomalies.push('B: resposta inesperada: ' + JSON.stringify(e.data));
+              if (e.data && e.data.type === 'connected') {
+                /* Mensagem de handshake inicial — ignorar, aguardar pong */
+                gotConn = true;
+                return;
               }
+              if (e.data && e.data.type === 'pong') {
+                gotPong = true;
+                return;
+              }
+              /* Qualquer outra resposta é inesperada */
+              anomalies.push('B: resposta inesperada após ping: ' + JSON.stringify(e.data));
             };
 
-            /* postMessage ANTES de start() — deve ser enfileirado */
+            /* postMessage ANTES de start() — deve ser enfileirado no port */
             port.postMessage({ cmd: 'ping' });
 
-            /* Agora chamar start() — deve liberar a mensagem e obter pong */
+            /* start() libera a fila — 'connected' chega primeiro, depois 'pong' */
             port.start();
 
             setTimeout(function () {
-              if (!gotReply) {
-                anomalies.push('B: pong nunca chegou após start() com mensagem pré-enfileirada');
+              if (!gotPong) {
+                anomalies.push(
+                  'B: pong nunca chegou após start()' +
+                  ' (connected=' + gotConn + ')'
+                );
               }
               port.close();
               done('B');
@@ -316,3 +334,4 @@
   };
 
 }(window));
+
