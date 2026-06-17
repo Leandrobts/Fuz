@@ -56,27 +56,64 @@
         }
       }());
 
-      /* ── Variante B: truncar o array durante o sort ── */
+      /* ── Variante B: OOB Write potencial via escrita além de SIZE durante sort ──
+       *
+       * O JSC cacheia length=SIZE antes do loop C++.
+       * O comparator escreve em arr[SIZE], arr[SIZE+1], arr[SIZE+7] enquanto
+       * o sort está ativo. Ao terminar, o JSC restaura arr.length = SIZE.
+       *
+       * Se arr.length === SIZE mas arr[SIZE..SIZE+7] ainda contém MARKER:
+       *   → escrita persistiu além do boundary declarado = OOB Write confirmado.
+       * Se arr.length > SIZE:
+       *   → array expandiu normalmente, escrita foi capturada pelo length.
+       */
       (function variantB() {
         try {
-          var SIZE = 64;
-          var a    = [];
+          var SIZE   = 64;
+          var MARKER = 9999.0001;
+          var a      = [];
           for (var i = 0; i < SIZE; i++) a.push(Math.random());
-          var cut = false;
+          var done   = false;
 
           a.sort(function (x, y) {
-            if (!cut) { cut = true; a.length = 4; }
+            if (!done) {
+              done = true;
+              /* Escrever além de SIZE enquanto sort usa length cacheado */
+              a[SIZE]     = MARKER;
+              a[SIZE + 1] = MARKER;
+              a[SIZE + 7] = MARKER;
+            }
             return x - y;
           });
 
-          /* Após truncar para 4, tentar ler posições 4..15 */
-          var leaks = [];
-          for (var j = 4; j < 16; j++) {
-            var v = a[j];
-            if (v !== undefined) leaks.push({ idx: j, val: v });
-          }
-          if (leaks.length > 0) {
-            anomalies.push('B: leitura além do length truncado: ' + JSON.stringify(leaks));
+          var finalLen = a.length;
+
+          if (finalLen === SIZE) {
+            /* JSC restaurou length — verificar se MARKERs persistem além do boundary */
+            var persist = [];
+            for (var j = SIZE; j < SIZE + 8; j++) {
+              if (a[j] === MARKER) persist.push(j);
+            }
+            if (persist.length > 0) {
+              anomalies.push(
+                'B: OOB Write confirmado — length restaurado para ' + SIZE +
+                ' mas MARKER persiste em idx [' + persist.join(', ') + ']'
+              );
+            }
+          } else if (finalLen > SIZE) {
+            /* Array expandiu — escrita capturada no length, não é OOB Write */
+            var missing = [SIZE, SIZE + 1, SIZE + 7].filter(function (idx) {
+              return a[idx] !== MARKER;
+            });
+            if (missing.length > 0) {
+              anomalies.push(
+                'B: array expandiu para ' + finalLen +
+                ' mas MARKER ausente nos idx [' + missing.join(', ') + ']'
+              );
+            }
+            /* Comportamento esperado quando sort NÃO restaura o length */
+          } else {
+            anomalies.push('B: length inválido após sort: ' + finalLen);
           }
         } catch (e) {
           anomalies.push('B: exceção: ' + String(e));
@@ -150,3 +187,4 @@
   };
 
 }(window));
+
