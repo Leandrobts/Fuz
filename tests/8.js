@@ -184,46 +184,134 @@
           }
         }());
 
-        /* ── Variante D: postMessage após port.close() ── */
+        /* ── Variante D: postMessage após port.close() ──
+         *
+         * CONFIRMADO: WebKit 605.1.15 faz silent drop, igual ao 6-B.
+         *
+         * D1 — comportamento base (mantido)
+         * D2 — verificar se o worker recebeu a mensagem "silenciada"
+         *       abrindo uma nova conexão e consultando o msgCount do worker
+         * D3 — race síncrono: postMessage→close() na mesma call stack
+         *       sem aguardar 'connected' — testa o caminho de dispatch
+         *       antes do handshake completar
+         */
         (function variantD() {
-          try {
-            var w    = makeWorker('fuzz-D');
-            var port = w.port;
-            port.start();
+          /* D1: base confirmado */
+          (function d1() {
+            try {
+              var w    = makeWorker('fuzz-D1');
+              var port = w.port;
+              port.start();
 
-            /* Aguardar conexão confirmada antes de fechar */
-            port.onmessage = function (e) {
-              if (e.data && e.data.type === 'connected') {
-                port.onmessage = null;
-                port.close();
+              port.onmessage = function (e) {
+                if (e.data && e.data.type === 'connected') {
+                  port.onmessage = null;
+                  port.close();
 
-                var threw = false;
-                try {
-                  port.postMessage({ cmd: 'ping' });
-                } catch (e2) {
-                  threw = true;
-                  var name = e2.name || '';
-                  if (name !== 'InvalidStateError') {
-                    anomalies.push('D: exceção esperada InvalidStateError, recebeu: ' + name);
+                  var threw = false;
+                  try {
+                    port.postMessage({ cmd: 'ping' });
+                  } catch (e2) {
+                    threw = true;
+                    if ((e2.name || '') !== 'InvalidStateError') {
+                      anomalies.push('D1: exceção inesperada: ' + e2.name);
+                    }
+                  }
+                  if (!threw) {
+                    anomalies.push('D1: silent drop confirmado — postMessage não lançou exceção após close()');
                   }
                 }
-                if (!threw) {
-                  anomalies.push('D: postMessage após close() não lançou exceção');
+              };
+              setTimeout(function () {
+                if (w.port.onmessage !== null) {
+                  anomalies.push('D1: connected nunca recebido');
                 }
-                done('D');
-              }
-            };
+              }, 2000);
+            } catch (e) {
+              anomalies.push('D1: ' + String(e));
+            }
+          }());
 
-            /* Timeout de segurança caso 'connected' nunca chegue */
-            setTimeout(function () {
-              if (w.port.onmessage !== null) {
-                anomalies.push('D: mensagem connected nunca recebida');
-                done('D');
+          /* D2: o worker recebeu a mensagem "silenciada"?
+           * Após o silent drop, abrimos uma 2ª conexão e pedimos o msgCount.
+           * Se msgCount > 0, o worker processou a mensagem mesmo com a porta fechada. */
+          (function d2() {
+            try {
+              var wName  = 'fuzz-D2-' + Date.now();
+              var w1     = makeWorker(wName);
+              w1.port.start();
+
+              w1.port.onmessage = function (e) {
+                if (e.data && e.data.type === 'connected') {
+                  w1.port.onmessage = null;
+                  w1.port.close();
+                  try { w1.port.postMessage({ cmd: 'ping' }); } catch (_) {}
+
+                  /* Aguardar 200ms e abrir nova conexão para consultar msgCount */
+                  setTimeout(function () {
+                    try {
+                      var w2 = makeWorker(wName);
+                      w2.port.start();
+                      w2.port.onmessage = function (e2) {
+                        if (e2.data && e2.data.type === 'connected') {
+                          w2.port.postMessage({ cmd: 'port-count' });
+                          return;
+                        }
+                        /* Usar 'echo' para pedir msgCount indiretamente */
+                        if (e2.data && e2.data.type === 'port-count') {
+                          /* Se msgCount > 0 dentro do worker, o pong foi processado */
+                          var portCount = e2.data.count;
+                          anomalies.push(
+                            'D2: INFO — após silent drop, portCount no worker=' + portCount
+                          );
+                          w2.port.close();
+                        }
+                      };
+                    } catch (e3) {
+                      anomalies.push('D2: reconexão falhou: ' + String(e3));
+                    }
+                  }, 200);
+                }
+              };
+            } catch (e) {
+              anomalies.push('D2: ' + String(e));
+            }
+          }());
+
+          /* D3: race síncrono postMessage→close() sem aguardar handshake
+           * Abre conexão, imediatamente posta e fecha na mesma call stack.
+           * Testa o caminho onde close() e postMessage disputam antes
+           * do worker ter registrado a porta. */
+          (function d3() {
+            try {
+              var w    = makeWorker('fuzz-D3-' + Date.now());
+              var port = w.port;
+              port.start();
+
+              /* Sem aguardar 'connected' — fechar imediatamente após start() */
+              var threw = false;
+              try {
+                port.postMessage({ cmd: 'ping' }); /* antes do close */
+              } catch (e2) {
+                threw = true;
               }
-            }, 2000);
-          } catch (e) {
-            done('D', String(e));
-          }
+              port.close();
+              try {
+                port.postMessage({ cmd: 'ping2' }); /* depois do close */
+              } catch (e3) {
+                /* Esperado InvalidStateError */
+              }
+
+              anomalies.push(
+                'D3: INFO — postMessage pré-close ' + (threw ? 'lançou' : 'silenciou') +
+                ' | postMessage pós-close ' + (threw ? '' : 'ambos silenciaram')
+              );
+            } catch (e) {
+              anomalies.push('D3: ' + String(e));
+            }
+          }());
+
+          done('D');
         }());
 
         /* ── Variante E: worker self.close() com porta ativa ── */
@@ -334,4 +422,3 @@
   };
 
 }(window));
-
