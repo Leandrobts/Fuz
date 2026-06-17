@@ -70,34 +70,39 @@
           }
         }());
 
-        /* ── Variante B: putImageData com ImageData maior que o canvas ── */
+        /* ── Variante B: putImageData com offset que cria região não-overlap clara ──
+         *
+         * Fix do falso positivo anterior: offset (-16,-16) com ImageData 64×64
+         * cobria o canvas 32×32 inteiro — não havia região não-overlap.
+         *
+         * Nova configuração:
+         *   Canvas   : 64×64 transparente
+         *   ImageData: 32×32 preenchida com vermelho (R=255, A=255)
+         *   Offset   : (40, 40) → preenche apenas canvas[40..63]×[40..63]
+         *   Não-overlap: canvas[0..39]×[0..39] deve permanecer transparente
+         */
         (function variantB() {
           try {
-            var r   = makeCanvas(32, 32, null); // canvas transparente
+            var r   = makeCanvas(64, 64, null); // canvas 64×64 transparente
             var ctx = r.ctx;
 
-            /* ImageData 2× maior, totalmente opaca (R=255) */
-            var large = ctx.createImageData(64, 64);
-            for (var i = 0; i < large.data.length; i += 4) {
-              large.data[i]     = 255; // R
-              large.data[i + 3] = 255; // A
+            var imgData = ctx.createImageData(32, 32);
+            for (var i = 0; i < imgData.data.length; i += 4) {
+              imgData.data[i]     = 255; // R
+              imgData.data[i + 3] = 255; // A
             }
 
-            /* Colocar com offset negativo (-16,-16) — overlap [16..31]x[16..31] no canvas */
-            ctx.putImageData(large, -16, -16);
+            /* Colocar em (40,40) — overlap apenas em [40..63]×[40..63] */
+            ctx.putImageData(imgData, 40, 40);
 
-            /* Verificar região que NÃO deve ter sido afetada: linha 0, cols 0..14 */
-            var check = ctx.getImageData(0, 0, 32, 32);
+            /* Verificar [0..39]×[0..39] — deve ser 100% transparente */
+            var check = ctx.getImageData(0, 0, 40, 40);
             var bad   = 0;
-            for (var row = 0; row < 15; row++) {
-              for (var col = 0; col < 15; col++) {
-                var idx = (row * 32 + col) * 4;
-                /* r=255 aq indica que pixels além da overlap foram escritos */
-                if (check.data[idx] === 255 && check.data[idx + 3] === 255) bad++;
-              }
+            for (var j = 0; j < check.data.length; j += 4) {
+              if (check.data[j] !== 0 || check.data[j + 3] !== 0) bad++;
             }
             if (bad > 0) {
-              anomalies.push('B: ' + bad + ' pixels vermelho em região não-overlap');
+              anomalies.push('B: ' + bad + ' pixels não-transparentes em região não-overlap [0..39]×[0..39]');
             }
           } catch (e) {
             anomalies.push('B: exceção: ' + String(e));
@@ -208,3 +213,4 @@
   };
 
 }(window));
+
