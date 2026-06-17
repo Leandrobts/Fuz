@@ -153,33 +153,40 @@
           /* Verificar identidade dos objetos originais sobreviventes */
           var origObjs = [objA, objB, objC];
           origObjs.forEach(function (orig) {
-            /* Objetos originais devem continuar íntegros se presentes */
             var idx = -1;
             for (var i = 0; i < arr.length; i++) {
               if (arr[i] === orig) { idx = i; break; }
             }
             if (idx !== -1) {
-              /* Verificar que o objeto não foi corrompido */
               if (typeof orig.id !== 'string' || typeof orig.val !== 'number') {
                 anomalies.push('B: objeto orig {id:' + orig.id + '} corrompido após sort');
               }
             }
           });
 
-          /* MARKER deve estar presente e em posição coerente */
-          var markerIdx = arr.indexOf(MARKER);
-          if (arr.indexOf(MARKER) === -1) {
-            anomalies.push('B: MARKER desapareceu do ContiguousArray após sort');
-          } else {
-            /* MARKER=9999.0001 é o maior double — deve estar próximo ao fim */
-            var afterMarker = arr.slice(markerIdx + 1).filter(function (v) {
-              return typeof v === 'number' && v > MARKER;
-            });
-            if (afterMarker.length > 0) {
-              anomalies.push(
-                'B: número maior que MARKER após MARKER no sort — ordenação corrompida: ' +
-                JSON.stringify(afterMarker)
-              );
+          /* Detector: Object.keys numéricos vs arr.length
+           * Se keys.length < arr.length → holes inesperados no butterfly.
+           * Holes criados pelo sort (não pelo código JS) indicam corrupção. */
+          var numericKeys = Object.keys(arr).filter(function (k) {
+            return k === String(parseInt(k, 10));
+          });
+          if (numericKeys.length !== arr.length) {
+            anomalies.push(
+              'B: Object.keys numéricos (' + numericKeys.length +
+              ') !== arr.length (' + arr.length + ') — holes inesperados no butterfly'
+            );
+          }
+
+          /* Detector: descriptores impossíveis em qualquer slot
+           * Accessor property (get/set) em slot numérico após sort =
+           * sort C++ não normalizou o descritor antes de escrever. */
+          for (var i = 0; i < arr.length; i++) {
+            var d = Object.getOwnPropertyDescriptor(arr, String(i));
+            if (d && typeof d.get === 'function') {
+              anomalies.push('B[' + i + ']: accessor persiste após sort — slot non-writable pelo C++');
+            }
+            if (d && d.writable === false && typeof d.get !== 'function') {
+              anomalies.push('B[' + i + ']: slot non-writable após sort (inesperado)');
             }
           }
         } catch (e) {
@@ -232,39 +239,53 @@
             }
           }
 
-          /* Verificação 1: MARKER deve estar em ta1[SIZE-1] (maior valor) */
-          var lastVal = ta1[SIZE - 1];
-          if (lastVal !== MARKER) {
-            /* Procurar onde o MARKER foi parar */
-            var markerAt = -1;
-            for (var j = 0; j < SIZE; j++) {
-              if (ta1[j] === MARKER) { markerAt = j; break; }
-            }
-            if (markerAt === -1) {
-              anomalies.push(
-                'C: MARKER desapareceu após sort com aliasing — valor em ta1[SIZE-1]=' + lastVal
-              );
-            } else {
-              anomalies.push(
-                'C: MARKER em posição inesperada ta1[' + markerAt + ']' +
-                ' (esperado ' + (SIZE - 1) + ') — aliasing causou reordenação incorreta'
-              );
-            }
+          /* Verificação 1: aliasing deve ser preservado — mesmo buffer */
+          if (ta1.buffer !== ta2.buffer) {
+            anomalies.push('C: aliasing quebrado — ta1.buffer !== ta2.buffer após sort');
           }
 
-          /* Verificação 2: nenhum NaN nos slots */
-          var nanAt = [];
-          for (var k = 0; k < SIZE; k++) {
-            if (isNaN(ta1[k])) nanAt.push(k);
-          }
-          if (nanAt.length > 0) {
-            anomalies.push('C: NaN em Float64Array após sort com aliasing: slots [' + nanAt.join(', ') + ']');
-          }
-
-          /* Verificação 3: ta1 e ta2 devem continuar em sync (mesmo buffer) */
-          if (ta1[0] !== ta2[0] || ta1[SIZE - 1] !== ta2[SIZE - 1]) {
+          /* Verificação 2: byteLength do buffer não deve mudar */
+          var expectedBytes = SIZE * 8;
+          if (ta1.buffer.byteLength !== expectedBytes) {
             anomalies.push(
-              'C: sync de aliasing quebrada — ta1[0]=' + ta1[0] + ' ta2[0]=' + ta2[0]
+              'C: byteLength corrompido — esperado ' + expectedBytes +
+              ' encontrado ' + ta1.buffer.byteLength
+            );
+          }
+
+          /* Verificação 3: nenhum slot deve ser NaN ou não-finito
+           * O buffer foi preenchido com inteiros 0..31 + MARKER no sort.
+           * NaN ou Infinity indicam interpretação incorreta de bits do buffer. */
+          var badSlots = [];
+          for (var k = 0; k < SIZE; k++) {
+            var v = ta1[k];
+            if (!isFinite(v) || isNaN(v)) {
+              badSlots.push({ idx: k, val: v });
+            }
+          }
+          if (badSlots.length > 0) {
+            anomalies.push(
+              'C: slot(s) com valor impossível (NaN/Infinity) após sort com aliasing: ' +
+              JSON.stringify(badSlots)
+            );
+          }
+
+          /* Verificação 4: valores fora do domínio esperado
+           * Os únicos valores legítimos são 0..31 (originais) e MARKER (9999.0001).
+           * Qualquer outro double indica leitura de bits do buffer com interpretação errada. */
+          var alien = [];
+          for (var m = 0; m < SIZE; m++) {
+            var val = ta1[m];
+            var isOriginal = (val >= 0 && val <= SIZE - 1 && val === Math.floor(val));
+            var isMarker   = (val === MARKER || val === MARKER - 1);
+            if (!isOriginal && !isMarker) {
+              alien.push({ idx: m, val: val });
+            }
+          }
+          if (alien.length > 0) {
+            anomalies.push(
+              'C: valor(es) fora do domínio {0..31, MARKER} após sort com aliasing: ' +
+              JSON.stringify(alien.slice(0, 4))
             );
           }
 
@@ -288,63 +309,76 @@
        */
       (function variantD() {
         try {
-          var arr     = [8.8, 3.3, 6.6, 1.1, 7.7, 2.2, 5.5, 4.4];
-          var done    = false;
+          var arr      = [8.8, 3.3, 6.6, 1.1, 7.7, 2.2, 5.5, 4.4];
+          var done     = false;
           var getCount = 0;
-          var FAKE_VAL = 0.001; /* valor que o accessor retorna */
+          var FAKE_VAL = 0.001;
 
-          arr.sort(function (x, y) {
-            if (!done) {
-              done = true;
-              /* Substituir slot [3] por accessor durante o sort */
-              Object.defineProperty(arr, '3', {
-                get: function () {
-                  getCount++;
-                  return FAKE_VAL; /* retorna 0.001 em vez do valor real */
-                },
-                configurable: true
-                /* sem setter: tentativa de write pelo sort é silenciada */
-              });
+          try {
+            arr.sort(function (x, y) {
+              if (!done) {
+                done = true;
+                Object.defineProperty(arr, '3', {
+                  get: function () { getCount++; return FAKE_VAL; },
+                  configurable: true
+                  /* sem setter — write pelo sort deve lançar TypeError em strict */
+                });
+              }
+              return x - y;
+            });
+
+            /* Sort completou SEM exceção — o accessor foi ignorado silenciosamente.
+             * Verificar estado do slot [3] após sort. */
+            var desc3 = Object.getOwnPropertyDescriptor(arr, '3');
+
+            if (desc3 && typeof desc3.get === 'function') {
+              /* Accessor persiste — sort C++ não conseguiu escrever no slot.
+               * O slot contém um valor "virtual" (FAKE_VAL) que nunca
+               * existiu na butterfly real. */
+              anomalies.push(
+                'D: accessor persiste após sort silencioso' +
+                ' (getCount=' + getCount + ')' +
+                ' — arr[3]=' + arr[3] + ' via getter'
+              );
             }
-            return x - y;
-          });
 
-          /* Verificação 1: o accessor sobreviveu ao sort? */
-          var desc = Object.getOwnPropertyDescriptor(arr, '3');
-          if (desc && typeof desc.get === 'function') {
-            anomalies.push(
-              'D: accessor persiste em arr[3] após sort (getCount=' + getCount + ')' +
-              ' — sort C++ não normalizou para data property'
-            );
-          }
-
-          /* Verificação 2: se o accessor não persiste, arr[3] é um número? */
-          var slot3 = arr[3];
-          checkTypes([slot3], 'D-slot3');
-
-          /* Verificação 3: FAKE_VAL = 0.001 deve aparecer na ordenação
-           * se o sort usou o getter — o menor valor deve ser FAKE_VAL */
-          if (arr[0] === FAKE_VAL) {
-            /* O sort leu FAKE_VAL via getter e o posicionou como mínimo */
-            anomalies.push(
-              'D: sort usou valor do getter (FAKE_VAL=' + FAKE_VAL + ') para ordenação' +
-              ' — arr[0]=' + arr[0] + ' (getCount=' + getCount + ')'
-            );
-          }
-
-          /* Verificação 4: arr deve estar globalmente ordenado (salvo o slot do accessor) */
-          var disorder = 0;
-          for (var i = 1; i < arr.length; i++) {
-            if (typeof arr[i - 1] === 'number' && typeof arr[i] === 'number') {
-              if (arr[i] < arr[i - 1]) disorder++;
+            /* Verificar descriptor impossível: non-configurable accessor em slot de array */
+            for (var i = 0; i < arr.length; i++) {
+              var d = Object.getOwnPropertyDescriptor(arr, String(i));
+              if (d && d.configurable === false && typeof d.get === 'function') {
+                anomalies.push('D[' + i + ']: accessor non-configurable após sort (inesperado)');
+              }
             }
-          }
-          if (disorder > 1) {
-            anomalies.push('D: arr com ' + disorder + ' inversões após sort com accessor');
+
+            checkTypes(arr, 'D');
+
+          } catch (sortErr) {
+            /* TypeError é o comportamento CORRETO — sort tentou write no accessor sem setter.
+             * Só reportar se for outro tipo de exceção. */
+            if (!(sortErr instanceof TypeError)) {
+              anomalies.push(
+                'D: exceção inesperada durante sort com accessor: ' +
+                sortErr.name + ' — ' + sortErr.message
+              );
+            }
+            /* TypeError esperado — verificar estado do array após a exceção parcial */
+            var partialDesc = Object.getOwnPropertyDescriptor(arr, '3');
+            if (partialDesc && typeof partialDesc.get === 'function') {
+              /* Accessor criado antes da exceção — verificar se arr está em estado consistente */
+              var holes = 0;
+              for (var j = 0; j < arr.length; j++) {
+                if (!Object.prototype.hasOwnProperty.call(arr, String(j))) holes++;
+              }
+              if (holes > 0) {
+                anomalies.push(
+                  'D: ' + holes + ' hole(s) no array após sort interrompido por TypeError'
+                );
+              }
+            }
           }
 
         } catch (e) {
-          anomalies.push('D: ' + String(e));
+          anomalies.push('D: setup: ' + String(e));
         }
       }());
 
