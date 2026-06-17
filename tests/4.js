@@ -56,38 +56,51 @@
           }
         }());
 
-        /* ── Variante B: MutationObserver remove nós no callback ── */
+        /* ── Variante B: MutationObserver remove nós no callback ──
+         *
+         * Fix: o disconnect() anterior era síncrono, cancelando os
+         * records antes das microtasks do MutationObserver rodarem.
+         * Agora aguardamos um ciclo de event loop via setTimeout antes
+         * de verificar e desconectar.
+         */
         (function variantB() {
-          var observed  = document.createElement('div');
+          var observed    = document.createElement('div');
+          var removedByObs = 0;
           root.appendChild(observed);
+
           var obs = new MutationObserver(function (mutations) {
             mutations.forEach(function (m) {
               m.addedNodes.forEach(function (node) {
                 if (node.parentNode) {
-                  try { node.parentNode.removeChild(node); } catch (_) {}
+                  try {
+                    node.parentNode.removeChild(node);
+                    removedByObs++;
+                  } catch (_) {}
                 }
               });
             });
           });
-          obs.observe(observed, { childList: true, subtree: true });
+          obs.observe(observed, { childList: true });
 
           for (var i = 0; i < 50; i++) {
-            var el = document.createElement('p');
-            observed.appendChild(el);
+            observed.appendChild(document.createElement('p'));
           }
 
-          obs.disconnect();
+          /* Aguardar microtasks do MutationObserver antes de verificar */
+          setTimeout(function () {
+            obs.disconnect();
 
-          /* Flush de observers pendentes */
-          var records = obs.takeRecords();
-
-          if (observed.childNodes.length > 5) {
-            /* Se sobrou muita coisa, o observer pode ter perdido eventos */
-            anomalies.push('B: observed.childNodes=' + observed.childNodes.length + ' após observer removal');
-          }
-          if (observed.parentNode) {
-            try { observed.parentNode.removeChild(observed); } catch (_) {}
-          }
+            /* O callback deve ter removido todos os 50 nós */
+            if (observed.childNodes.length > 0) {
+              anomalies.push(
+                'B: ' + observed.childNodes.length + ' nós não removidos pelo observer' +
+                ' (removedByObs=' + removedByObs + ')'
+              );
+            }
+            if (observed.parentNode) {
+              try { observed.parentNode.removeChild(observed); } catch (_) {}
+            }
+          }, 50);
         }());
 
         /* ── Variante C: iframe lifecycle antes do load ── */
@@ -174,3 +187,4 @@
   };
 
 }(window));
+
