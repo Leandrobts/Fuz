@@ -104,7 +104,142 @@
           }
         }());
 
-        /* ── Variante B: get 'length' não-determinístico durante map ── */
+        /* ── Variante A2: re-entrância sem flag — mede profundidade do loop ──
+         *
+         * A original tem flag `reentry` que limita a 1 re-entrada.
+         * Aqui removemos a proteção e usamos um contador para medir
+         * quantas vezes o set trap dispara recursivamente antes de
+         * o motor detectar stack overflow ou encerrar.
+         *
+         * Se o motor não detectar a recursão e o contador explodir,
+         * é evidência de que a cadeia de re-entrância é arbitrariamente profunda.
+         */
+        (function variantA2() {
+          try {
+            var target   = [1.1, 2.2, 3.3, 4.4, 5.5];
+            var depth    = 0;
+            var MAX_SAFE = 50; /* limite de segurança para evitar stack overflow real */
+
+            var proxy = new Proxy(target, {
+              get: function (t, prop, recv) {
+                var val = Reflect.get(t, prop, recv);
+                if (typeof val === 'function') {
+                  return function () { return val.apply(t, arguments); };
+                }
+                return val;
+              },
+              set: function (t, prop, val, recv) {
+                depth++;
+                if (depth < MAX_SAFE && !isNaN(parseInt(prop, 10))) {
+                  /* Re-entrar: escrever no próximo slot, disparando set de novo */
+                  var nextIdx = (parseInt(prop, 10) + 1) % target.length;
+                  t[nextIdx] = (typeof val === 'number') ? val + 0.0001 : val;
+                }
+                return Reflect.set(t, prop, val, recv);
+              }
+            });
+
+            proxy.forEach(function (v, i) {
+              proxy[i] = v * 2;
+            });
+
+            if (depth >= MAX_SAFE) {
+              anomalies.push(
+                'A2: re-entrância ilimitada detectada — depth=' + depth +
+                ' atingiu MAX_SAFE=' + MAX_SAFE +
+                ' (cadeia potencialmente arbitrária)'
+              );
+            } else {
+              /* Registrar profundidade real como info */
+              anomalies.push('A2: INFO — profundidade de re-entrância: depth=' + depth);
+            }
+          } catch (e) {
+            /* Stack overflow esperado se a recursão for real */
+            var isStackOF = /stack|recursion|maximum call/i.test(String(e));
+            anomalies.push(
+              'A2: ' + (isStackOF ? 'stack overflow confirmado' : 'exceção inesperada') +
+              ' — ' + String(e)
+            );
+          }
+        }());
+
+        /* ── Variante A3: re-entrância com objeto {} — força Double→Contiguous ──
+         *
+         * Em vez de escrever MARKER (float), a re-entrância escreve um objeto
+         * no slot [4] durante o set do slot [0]. Isso força a transição
+         * DoubleArray→ContiguousArray NO MEIO da iteração do forEach.
+         * Se o forEach não atualiza o ponteiro interno de iteração para o
+         * novo layout da butterfly, o acesso subsequente a [5..7] pode ler
+         * slots com a interpretação de tipo errada.
+         */
+        (function variantA3() {
+          try {
+            var target    = [1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7]; /* DoubleArray */
+            var reentry   = false;
+            var sentinel  = { injected: true, uid: 0xCAFE };
+            var readTypes = [];
+
+            var proxy = new Proxy(target, {
+              get: function (t, prop, recv) {
+                var val = Reflect.get(t, prop, recv);
+                /* Capturar tipo de cada leitura de slot numérico após transição */
+                if (reentry && !isNaN(parseInt(prop, 10))) {
+                  readTypes.push({ prop: prop, type: typeof val });
+                }
+                if (typeof val === 'function') {
+                  return function () { return val.apply(t, arguments); };
+                }
+                return val;
+              },
+              set: function (t, prop, val, recv) {
+                if (!reentry && prop === '0') {
+                  reentry = true;
+                  /* Injetar objeto no slot [4] — força transição de tipo */
+                  t[4] = sentinel;
+                }
+                return Reflect.set(t, prop, val, recv);
+              }
+            });
+
+            proxy.forEach(function (v, i) {
+              proxy[i] = (typeof v === 'number') ? v * 2 : v;
+            });
+
+            /* Verificar slot [4]: deve ter o sentinel injetado */
+            if (target[4] !== sentinel && !(target[4] && target[4].injected)) {
+              anomalies.push(
+                'A3: sentinel não encontrado em target[4] após transição: ' +
+                typeof target[4] + '=' + target[4]
+              );
+            }
+
+            /* Verificar se forEach leu tipos incorretos após a transição */
+            var badTypes = readTypes.filter(function (r) {
+              return r.type !== 'number' && r.type !== 'object' && r.type !== 'undefined';
+            });
+            if (badTypes.length > 0) {
+              anomalies.push(
+                'A3: tipos inesperados em leituras pós-transição: ' +
+                JSON.stringify(badTypes)
+              );
+            }
+
+            /* Verificar slots [5..6]: devem ser double*2, não corrompidos */
+            var corrupt = [];
+            for (var i = 5; i < 7; i++) {
+              if (typeof target[i] !== 'number') {
+                corrupt.push({ idx: i, type: typeof target[i] });
+              }
+            }
+            if (corrupt.length > 0) {
+              anomalies.push('A3: slots corrompidos após transição: ' + JSON.stringify(corrupt));
+            }
+          } catch (e) {
+            if (!(e instanceof TypeError)) {
+              anomalies.push('A3: exceção inesperada: ' + String(e));
+            }
+          }
+        }());
         (function variantB() {
           try {
             var target  = [1, 2, 3, 4];
@@ -261,13 +396,9 @@
                 }
               });
 
-              /* Se forEach cacheou length=8: visitará todos 8 slots,
-               * incluindo [3..7] cujos valores podem ser undefined
-               * (slots além do novo length). */
               var beyondTrunc = visited.filter(function (i) { return i >= TRUNC; });
 
               if (beyondTrunc.length > 0) {
-                /* Verificar se os valores eram defined ou undefined */
                 var undefReads = [];
                 beyondTrunc.forEach(function (i) {
                   var pos = visited.indexOf(i);
@@ -277,7 +408,7 @@
                 anomalies.push(
                   'E2: forEach visitou ' + beyondTrunc.length +
                   ' slots além de length truncado para ' + TRUNC +
-                  ' | idx visitados=[' + beyondTrunc.join(', ') + ']' +
+                  ' | idx=[' + beyondTrunc.join(', ') + ']' +
                   (undefReads.length > 0
                     ? ' | undefined em [' + undefReads.join(', ') + ']'
                     : ' | todos defined')
@@ -285,6 +416,96 @@
               }
             } catch (e) {
               anomalies.push('E2: ' + String(e));
+            }
+          }());
+
+          /* ── E3: Proxy retorna length=0 — forEach não deveria visitar nada ──
+           *
+           * Caso extremo de E1: se o Proxy mente que length=0 na 1ª leitura,
+           * forEach deveria encerrar imediatamente sem visitar nenhum slot.
+           * Se visitar algum slot, o length cacheado é ignorado ou há outro
+           * mecanismo de iteração que não depende do length do Proxy.
+           */
+          (function e3() {
+            try {
+              var target  = [10, 20, 30, 40, 50];
+              var visited = [];
+
+              var proxy = new Proxy(target, {
+                get: function (t, prop, recv) {
+                  if (prop === 'length') return 0; /* mentir: array vazio */
+                  return Reflect.get(t, prop, recv);
+                }
+              });
+
+              Array.prototype.forEach.call(proxy, function (v, i) {
+                visited.push({ i: i, v: v });
+              });
+
+              if (visited.length > 0) {
+                anomalies.push(
+                  'E3: forEach visitou ' + visited.length + ' slot(s) com length=0 via Proxy' +
+                  ' — idx=[' + visited.map(function (x) { return x.i; }).join(', ') + ']'
+                );
+              }
+            } catch (e) {
+              anomalies.push('E3: ' + String(e));
+            }
+          }());
+
+          /* ── E4: deletar slot durante iteração dos extras (além do TRUNC mentiroso) ──
+           *
+           * Combina E1 (length mentiroso) com deleção de slot durante o callback.
+           * Quando forEach está num slot "extra" (>= TRUNC), deletamos o slot
+           * seguinte. Se forEach usa HasProperty para decidir se chama o callback,
+           * o slot deletado deve ser pulado. Verificamos se o valor do slot
+           * deletado aparece mesmo assim no callback (indicando que HasProperty
+           * não foi relido após deleção, ou que o valor foi cacheado).
+           */
+          (function e4() {
+            try {
+              var TRUNC   = 3;
+              var target  = [1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8];
+              var lenReads = 0;
+              var visited  = [];
+              var deleted  = [];
+
+              var proxy = new Proxy(target, {
+                get: function (t, prop, recv) {
+                  if (prop === 'length') {
+                    lenReads++;
+                    if (lenReads > 1) return TRUNC; /* mente após 1ª leitura */
+                    return t.length;
+                  }
+                  return Reflect.get(t, prop, recv);
+                }
+              });
+
+              Array.prototype.forEach.call(proxy, function (v, i) {
+                visited.push({ i: i, v: v });
+                /* Durante slots extras, deletar o próximo */
+                if (i >= TRUNC && i + 1 < target.length) {
+                  delete target[i + 1];
+                  deleted.push(i + 1);
+                }
+              });
+
+              var extras = visited.filter(function (x) { return x.i >= TRUNC; });
+              if (extras.length > 0) {
+                /* Verificar se algum slot deletado apareceu no callback */
+                var deletedButVisited = extras.filter(function (x) {
+                  return deleted.indexOf(x.i) !== -1;
+                });
+                var detail = 'E4: extras visitados=[' +
+                  extras.map(function (x) { return x.i; }).join(', ') + ']';
+                if (deletedButVisited.length > 0) {
+                  detail += ' | slots deletados-mas-visitados=[' +
+                    deletedButVisited.map(function (x) { return x.i; }).join(', ') + ']';
+                }
+                anomalies.push(detail);
+              }
+            } catch (e) {
+              anomalies.push('E4: ' + String(e));
             }
           }());
         }());
@@ -377,4 +598,3 @@
   };
 
 }(window));
-
