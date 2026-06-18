@@ -1,216 +1,82 @@
 'use strict';
 /**
- * Teste 5 — Canvas 2D: ImageData boundary, OOB de pixels, createImageBitmap lifecycle
+ * Teste 5 — WebCore: UI Events & Target Teardown UAF
  *
- * O diagnóstico mostra:
- *   canvas: true  |  offscreen: false  |  ImageData: true
- *   ImageBitmap: true  |  createImageBitmap: true  |  webgl/webgl2: false
- *   Canvas OOB Baseline: nonZeroBytes=0  sample=00 00 00 00 00 00 00 00
- *
- * O baseline limpo é o comportamento esperado. Este teste procura desvios.
- *
- * Variantes:
- *   A — getImageData com origem negativa (clipping esperado, checar leak)
- *   B — putImageData com ImageData maior que o canvas (offset fora dos limites)
- *   C — createImageData(0, N) e (N, 0) — dimensão zero (deve lançar IndexSizeError)
- *   D — createImageBitmap lifecycle stress (criar + close em loop + GC pressure)
- *   E — drawImage de canvas para si mesmo (self-copy — comportamento indefinido)
+ * Foco: Forçar o C++ a iterar sobre uma cadeia de eventos (bubbling)
+ * onde os nós ancestrais ou o próprio target são destruídos de forma
+ * re-entrante durante a execução dos callbacks síncronos.
  */
 (function (global) {
   global.FuzzerTests = global.FuzzerTests || {};
 
   global.FuzzerTests['5'] = {
     id      : 5,
-    name    : 'Canvas 2D — ImageData boundary e createImageBitmap lifecycle',
-    category: 'Canvas',
-    timeout : 6000,
+    name    : 'WebCore.Events — Re-entrant dispatch and node teardown',
+    category: 'WebCore-Events-UAF',
+    timeout : 5000,
 
     run: function () {
-      return new Promise(function (resolve) {
-        var anomalies = [];
+      var anomalies = [];
+      var sandbox = document.createElement('div');
+      sandbox.id = 'fuzzer-sandbox-5';
+      document.body.appendChild(sandbox);
 
-        /* Helper: cria canvas pintado com cor sólida */
-        function makeCanvas(w, h, color) {
-          var c   = document.createElement('canvas');
-          c.width = w; c.height = h;
-          var ctx = c.getContext('2d');
-          if (color) { ctx.fillStyle = color; ctx.fillRect(0, 0, w, h); }
-          return { canvas: c, ctx: ctx };
+      /* ── Variante A: Bubbling Chain Destruction ──────────────────────── */
+      (function variantA() {
+        try {
+          var form = document.createElement('form');
+          var input = document.createElement('input');
+          form.appendChild(input);
+          sandbox.appendChild(form);
+
+          var step = 0;
+          var savedEvent = null;
+
+          form.addEventListener('focus', function(e) {
+            step++;
+            /* O alvo original (input) disparou o evento que agora subiu para o form.
+             * Destruímos a árvore inteira agora. */
+            sandbox.innerHTML = '';
+            
+            /* Tenta forçar a sobrescrita do C++ backing object (Heap Spray básico) */
+            var spray = [];
+            for (var i = 0; i < 500; i++) {
+              var ta = new Uint32Array(1024);
+              ta.fill(0x41414141);
+              spray.push(ta);
+            }
+
+            savedEvent = e;
+          }, true); // Capturing phase
+
+          /* Dispara o evento de forma síncrona */
+          input.focus();
+
+          /* Uso pós-liberação: O motor ainda sabe quem é o e.target? */
+          if (savedEvent) {
+            var t = savedEvent.target;
+            if (t) {
+              if (typeof t.nodeType !== 'number') {
+                anomalies.push('A: target corrompido no evento salvo (Type Confusion)');
+              } else if (t.parentNode !== null) {
+                /* Se o input ainda acha que tem um pai, os ponteiros do C++ estão desincronizados
+                 * pois sandbox.innerHTML = '' deveria ter isolado a árvore. */
+                anomalies.push('A: input zumbi relata parentNode ativo após innerHTML nuke');
+              }
+            }
+          }
+        } catch (e) {
+          anomalies.push('A: ' + String(e));
         }
+      }());
 
-        /* ── Variante A: getImageData com origem negativa ── */
-        (function variantA() {
-          try {
-            var r   = makeCanvas(64, 64, '#ff0000');
-            var ctx = r.ctx;
+      document.body.removeChild(sandbox);
 
-            /* Crop que começa antes do canto superior-esquerdo */
-            var imgData;
-            try {
-              imgData = ctx.getImageData(-8, -8, 80, 80);
-            } catch (e2) {
-              /* IndexSizeError ou SecurityError — esperado */
-              return;
-            }
-
-            /* Região antes do canvas (x<0 ou y<0) deve ser rgba(0,0,0,0) */
-            /* Linha 0, colunas 0..7 correspondem a x=-8..-1 → devem ser 0 */
-            var nonZero = 0;
-            for (var col = 0; col < 8; col++) {
-              var base = col * 4;
-              for (var ch = 0; ch < 4; ch++) {
-                if (imgData.data[base + ch] !== 0) nonZero++;
-              }
-            }
-            if (nonZero > 0) {
-              anomalies.push('A: ' + nonZero + ' bytes não-zero em região fora do canvas (linha 0, x=-8..-1)');
-            }
-          } catch (e) {
-            anomalies.push('A: exceção: ' + String(e));
-          }
-        }());
-
-        /* ── Variante B: putImageData com offset que cria região não-overlap clara ──
-         *
-         * Fix do falso positivo anterior: offset (-16,-16) com ImageData 64×64
-         * cobria o canvas 32×32 inteiro — não havia região não-overlap.
-         *
-         * Nova configuração:
-         *   Canvas   : 64×64 transparente
-         *   ImageData: 32×32 preenchida com vermelho (R=255, A=255)
-         *   Offset   : (40, 40) → preenche apenas canvas[40..63]×[40..63]
-         *   Não-overlap: canvas[0..39]×[0..39] deve permanecer transparente
-         */
-        (function variantB() {
-          try {
-            var r   = makeCanvas(64, 64, null); // canvas 64×64 transparente
-            var ctx = r.ctx;
-
-            var imgData = ctx.createImageData(32, 32);
-            for (var i = 0; i < imgData.data.length; i += 4) {
-              imgData.data[i]     = 255; // R
-              imgData.data[i + 3] = 255; // A
-            }
-
-            /* Colocar em (40,40) — overlap apenas em [40..63]×[40..63] */
-            ctx.putImageData(imgData, 40, 40);
-
-            /* Verificar [0..39]×[0..39] — deve ser 100% transparente */
-            var check = ctx.getImageData(0, 0, 40, 40);
-            var bad   = 0;
-            for (var j = 0; j < check.data.length; j += 4) {
-              if (check.data[j] !== 0 || check.data[j + 3] !== 0) bad++;
-            }
-            if (bad > 0) {
-              anomalies.push('B: ' + bad + ' pixels não-transparentes em região não-overlap [0..39]×[0..39]');
-            }
-          } catch (e) {
-            anomalies.push('B: exceção: ' + String(e));
-          }
-        }());
-
-        /* ── Variante C: createImageData com dimensão zero ── */
-        (function variantC() {
-          try {
-            var r   = makeCanvas(16, 16, null);
-            var ctx = r.ctx;
-            var cases = [
-              [0, 16], [16, 0], [0, 0],
-              [-1, 16], [16, -1]
-            ];
-            cases.forEach(function (pair) {
-              try {
-                var id = ctx.createImageData(pair[0], pair[1]);
-                /* Se não lançou, verificar se o objeto é seguro */
-                if (id && id.data && id.data.length === 0 && (pair[0] === 0 || pair[1] === 0)) {
-                  /* Aceitável — alguns motores permitem ImageData vazia */
-                } else if (id && id.width === Math.abs(pair[0]) && id.height === Math.abs(pair[1])) {
-                  /* OK — largura/altura absolutas */
-                } else if (id) {
-                  anomalies.push('C: createImageData(' + pair + ') => ' + id.width + 'x' + id.height);
-                }
-              } catch (e2) {
-                /* IndexSizeError/RangeError esperado para 0 ou negativo */
-                var name = e2.name || (e2.constructor && e2.constructor.name) || 'Error';
-                if (name !== 'IndexSizeError' && name !== 'RangeError' && !(e2 instanceof DOMException)) {
-                  anomalies.push('C: createImageData(' + pair + ') lançou ' + name + ': ' + e2.message);
-                }
-              }
-            });
-          } catch (e) {
-            anomalies.push('C: setup: ' + String(e));
-          }
-        }());
-
-        /* ── Variante D: createImageBitmap lifecycle stress ── */
-        (function variantD() {
-          if (typeof createImageBitmap !== 'function') return;
-          var r   = makeCanvas(128, 128, '#00ff00');
-
-          var promises = [];
-          for (var i = 0; i < 30; i++) {
-            (function (idx) {
-              var opts = (idx % 4 === 0)
-                ? { resizeWidth: 1, resizeHeight: 1 }         // downscale extremo
-                : (idx % 4 === 1)
-                  ? { resizeWidth: 256, resizeHeight: 256 }   // upscale
-                  : (idx % 4 === 2)
-                    ? { imageOrientation: 'flipY' }
-                    : {};
-
-              var p = createImageBitmap(r.canvas, 0, 0, 128, 128, opts)
-                .then(function (bmp) {
-                  /* Usar o bitmap imediatamente antes de fechar */
-                  var tmp = makeCanvas(bmp.width, bmp.height, null);
-                  tmp.ctx.drawImage(bmp, 0, 0);
-                  bmp.close();
-                  /* Tentar usar após close — deve ser silencioso ou lançar */
-                  try {
-                    tmp.ctx.drawImage(bmp, 0, 0);
-                  } catch (_) {
-                    /* Esperado: InvalidStateError */
-                  }
-                })
-                .catch(function () { /* Opções inválidas — ignorar */ });
-              promises.push(p);
-            }(i));
-          }
-
-          /* Não aguardamos o resultado aqui — deixamos o GC trabalhar assincronamente */
-          Promise.all(promises).catch(function () {});
-        }());
-
-        /* ── Variante E: drawImage de canvas para si mesmo (self-copy) ── */
-        (function variantE() {
-          try {
-            var r   = makeCanvas(64, 64, '#0000ff');
-            var ctx = r.ctx;
-            /* self-copy — comportamento indefinido na spec, mas não deve crashar */
-            ctx.drawImage(r.canvas, 0, 0);
-            ctx.drawImage(r.canvas, 32, 32, 32, 32, 0, 0, 32, 32);
-
-            /* Verificar que o canvas não ficou corrompido (não-preto) */
-            var pixel = ctx.getImageData(16, 16, 1, 1);
-            if (pixel.data[0] === 0 && pixel.data[1] === 0 && pixel.data[2] === 0 && pixel.data[3] === 255) {
-              /* Canvas ficou completamente preto — suspeito (era azul) */
-              anomalies.push('E: canvas ficou preto após self-copy (era azul)');
-            }
-          } catch (e) {
-            anomalies.push('E: ' + String(e));
-          }
-        }());
-
-        /* ── Resolver após dar tempo para Variante D (Promises async) ── */
-        setTimeout(function () {
-          if (anomalies.length > 0) {
-            resolve({ status: 'ANOMALY', detail: anomalies.join(' | ') });
-          } else {
-            resolve({ status: 'PASS', detail: 'A-E sem anomalias' });
-          }
-        }, 1200);
-      });
+      if (anomalies.length > 0) {
+        return { status: 'ANOMALY', detail: anomalies.join(' | ') };
+      }
+      return { status: 'PASS', detail: 'Event bubbling sobreviveu à destruição síncrona' };
     }
   };
 
 }(window));
-
