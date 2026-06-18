@@ -1,10 +1,13 @@
+'use strict';
+/**
+ * Teste 4 — WebCore: DOM Tree Manipulation (Circularity & Adoption)
+ *
+ * Foco: Burlar checagens de HierarchyRequestError e enganar o 
+ * Garbage Collector durante cross-document adoption.
+ */
+(function (global) {
+  global.FuzzerTests = global.FuzzerTests || {};
 
-
-  /**
-   * Teste 4 — WebCore: DOM Tree Manipulation (Circularity & Adoption)
-   * * Foco: Burlar checagens de HierarchyRequestError e enganar o 
-   * Garbage Collector durante cross-document adoption.
-   */
   global.FuzzerTests['4'] = {
     id      : 4,
     name    : 'WebCore.DOMManipulation — Tree Circularity and Adoption',
@@ -14,6 +17,7 @@
     run: function () {
       var anomalies = [];
       var sandbox = document.createElement('div');
+      sandbox.id = 'fuzzer-sandbox-4';
       document.body.appendChild(sandbox);
 
       /* ── Variante A: Hierarchy Circularity Bypass ──────────────────── */
@@ -88,7 +92,9 @@
 
       document.body.removeChild(sandbox);
 
-      if (anomalies.length > 0) return { status: 'ANOMALY', detail: anomalies.join(' | ') };
+      if (anomalies.length > 0) {
+        return { status: 'ANOMALY', detail: anomalies.join(' | ') };
+      }
       return { status: 'PASS', detail: 'Manipulação de árvore rejeitou ciclos e lidou com adoption' };
     }
   };
